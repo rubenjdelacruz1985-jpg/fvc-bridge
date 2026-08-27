@@ -55,7 +55,8 @@ $manifest = [ordered]@{
     package = "https://github.com/$repo/releases/download/v$version/fvc-bridge.zip"
 }
 $manifestPath = Join-Path $build 'manifest.json'
-$manifest | ConvertTo-Json | Out-File -FilePath $manifestPath -Encoding utf8
+# Write UTF-8 WITHOUT a BOM — PHP's json_decode() fails on a leading BOM.
+[System.IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "Wrote $manifestPath"
 
 Write-Host ""

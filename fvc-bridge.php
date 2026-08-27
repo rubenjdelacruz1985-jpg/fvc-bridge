@@ -170,7 +170,9 @@ function fvc_bridge_get_manifest($force = false) {
     if ( is_wp_error($res) || wp_remote_retrieve_response_code($res) !== 200 ) {
         return false;
     }
-    $data = json_decode(wp_remote_retrieve_body($res), true);
+    $body = wp_remote_retrieve_body($res);
+    $body = preg_replace('/^\xEF\xBB\xBF/', '', $body); // tolerate a leading UTF-8 BOM
+    $data = json_decode($body, true);
     if ( ! is_array($data) ) $data = false;
     set_site_transient('fvc_bridge_manifest', $data, 6 * HOUR_IN_SECONDS);
     return $data;
