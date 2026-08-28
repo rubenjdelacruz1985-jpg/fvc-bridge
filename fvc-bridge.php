@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.0.0');
+define('FVC_BRIDGE_VERSION',    '1.1.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -98,6 +98,18 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_self_update',
+    ));
+    // Public: the front-end forms call this to check for an existing listing.
+    register_rest_route('fvc-bridge/v1', '/check-duplicate', array(
+        'methods'             => 'POST',
+        'permission_callback' => '__return_true',
+        'callback'            => 'fvc_bridge_rest_check_dup',
+    ));
+    // Token-gated: list stored submissions (for review tooling).
+    register_rest_route('fvc-bridge/v1', '/submissions', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_submissions',
     ));
 });
 
@@ -201,6 +213,231 @@ function fvc_bridge_check_update($update, $plugin_data, $plugin_file) {
         'url'     => 'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge',
         'package' => $manifest['package'],
     );
+}
+
+/* ============================================================
+ *  Phase 1 — submissions store, capture, duplicate detection
+ * ============================================================ */
+
+define('FVC_BRIDGE_DB_VERSION', '1');
+
+function fvc_bridge_table() { global $wpdb; return $wpdb->prefix . 'fvc_listing_requests'; }
+
+function fvc_bridge_install_tables() {
+    if ( get_option('fvc_bridge_db_version') === FVC_BRIDGE_DB_VERSION ) return;
+    global $wpdb;
+    $table = fvc_bridge_table();
+    $charset = $wpdb->get_charset_collate();
+    $sql = "CREATE TABLE $table (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        type VARCHAR(20) NOT NULL DEFAULT 'add',
+        clinic_name VARCHAR(255) NOT NULL,
+        listing_url VARCHAR(255) NULL,
+        contact_name VARCHAR(255) NULL,
+        role VARCHAR(100) NULL,
+        email VARCHAR(255) NULL,
+        phone VARCHAR(100) NULL,
+        website VARCHAR(255) NULL,
+        address VARCHAR(255) NULL,
+        services TEXT NULL,
+        icbc VARCHAR(20) NULL,
+        worksafe VARCHAR(20) NULL,
+        billing VARCHAR(20) NULL,
+        booking VARCHAR(20) NULL,
+        notes TEXT NULL,
+        marketing_consent TINYINT(1) NOT NULL DEFAULT 0,
+        matched_post_id BIGINT UNSIGNED NULL,
+        match_score INT NULL,
+        status VARCHAR(20) NOT NULL DEFAULT 'new',
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY  (id),
+        KEY status (status),
+        KEY type (type)
+    ) $charset;";
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta($sql);
+    update_option('fvc_bridge_db_version', FVC_BRIDGE_DB_VERSION);
+}
+add_action('init', 'fvc_bridge_install_tables');
+
+// -- normalisation --
+function fvc_bridge_norm_name($s) {
+    $s = strtolower((string) $s);
+    $s = str_replace('&', ' and ', $s);
+    $s = preg_replace('/[^a-z0-9]+/', ' ', $s);
+    $s = preg_replace('/\b(the|clinic|clinics|centre|center|health|wellness|inc|ltd)\b/', ' ', $s);
+    return trim(preg_replace('/\s+/', ' ', $s));
+}
+function fvc_bridge_norm_domain($u) {
+    $u = strtolower((string) $u);
+    $u = preg_replace('#^https?://#', '', $u);
+    $u = preg_replace('#^www\.#', '', $u);
+    $parts = preg_split('#[/?\#]#', $u);
+    return trim($parts[0]);
+}
+function fvc_bridge_norm_phone($p) {
+    $d = preg_replace('/\D/', '', (string) $p);
+    return strlen($d) >= 10 ? substr($d, -10) : '';
+}
+function fvc_bridge_norm_street($s) {
+    $s = strtolower((string) $s);
+    $s = preg_replace('/[^a-z0-9]+/', ' ', $s);
+    return trim(preg_replace('/\s+/', ' ', $s));
+}
+
+// Best match for a candidate against published listings (>=45 score, else null).
+function fvc_bridge_find_match($cand) {
+    global $wpdb;
+    $rows = $wpdb->get_results(
+        "SELECT p.ID AS post_id, p.post_title AS name, d.street, d.`l` AS phone, d.website
+         FROM {$wpdb->prefix}posts p
+         JOIN {$wpdb->prefix}geodir_gd_place_detail d ON d.post_id = p.ID
+         WHERE p.post_type = 'gd_place' AND p.post_status = 'publish'", ARRAY_A);
+    if ( ! $rows ) return null;
+
+    $cn = fvc_bridge_norm_name($cand['name'] ?? '');
+    $cd = fvc_bridge_norm_domain($cand['website'] ?? '');
+    $cp = fvc_bridge_norm_phone($cand['phone'] ?? '');
+    $cs = fvc_bridge_norm_street($cand['address'] ?? '');
+    $best = null; $bestScore = 0;
+
+    foreach ( $rows as $r ) {
+        $score = 0;
+        $rd = fvc_bridge_norm_domain($r['website']);
+        $rp = fvc_bridge_norm_phone($r['phone']);
+        $rn = fvc_bridge_norm_name($r['name']);
+        $rs = fvc_bridge_norm_street($r['street']);
+        if ( $cd && $rd && $cd === $rd ) $score = max($score, 98);
+        if ( $cp && $rp && $cp === $rp ) $score = max($score, 92);
+        $ns = 0;
+        if ( $cn && $rn ) {
+            if ( $cn === $rn ) $ns = 60;
+            elseif ( strpos($rn, $cn) !== false || strpos($cn, $rn) !== false ) $ns = 42;
+            else {
+                $cw = array_values(array_filter(explode(' ', $cn), function ($w) { return strlen($w) > 2; }));
+                $rw = explode(' ', $rn);
+                $ov = 0;
+                foreach ( $cw as $w ) { foreach ( $rw as $x ) { if ( strpos($x, $w) !== false ) { $ov++; break; } } }
+                $ns = count($cw) ? round(($ov / count($cw)) * 35) : 0;
+            }
+        }
+        $ss = 0;
+        if ( $cs && $rs ) {
+            $csn = implode(' ', array_slice(explode(' ', $cs), 0, 3));
+            if ( $csn && strpos($rs, $csn) !== false ) $ss = 30;
+        }
+        $score = max($score, $ns + $ss);
+        if ( $score > $bestScore ) { $bestScore = $score; $best = $r; }
+    }
+    if ( $best && $bestScore >= 45 ) {
+        return array('score' => min(100, (int) $bestScore), 'post_id' => (int) $best['post_id'], 'name' => $best['name'], 'url' => get_permalink($best['post_id']));
+    }
+    return null;
+}
+
+function fvc_bridge_store_submission($type, $data) {
+    global $wpdb;
+    $wpdb->insert(fvc_bridge_table(), array(
+        'type'              => ($type === 'claim' ? 'claim' : 'add'),
+        'clinic_name'       => substr((string) ($data['clinic_name'] ?? ''), 0, 255),
+        'listing_url'       => $data['listing_url'] ?? null,
+        'contact_name'      => $data['contact_name'] ?? null,
+        'role'              => $data['role'] ?? null,
+        'email'             => $data['email'] ?? null,
+        'phone'             => $data['phone'] ?? null,
+        'website'           => $data['website'] ?? null,
+        'address'           => $data['address'] ?? null,
+        'services'          => $data['services'] ?? null,
+        'icbc'              => $data['icbc'] ?? null,
+        'worksafe'          => $data['worksafe'] ?? null,
+        'billing'           => $data['billing'] ?? null,
+        'booking'           => $data['booking'] ?? null,
+        'notes'             => $data['notes'] ?? null,
+        'marketing_consent' => ! empty($data['marketing_consent']) ? 1 : 0,
+        'matched_post_id'   => ! empty($data['matched_post_id']) ? absint($data['matched_post_id']) : null,
+        'match_score'       => isset($data['match_score']) ? (int) $data['match_score'] : null,
+        'status'            => 'new',
+        'created_at'        => current_time('mysql'),
+    ));
+    return (int) $wpdb->insert_id;
+}
+
+// Capture both existing forms (priority 1, does not exit — the real handler still runs).
+add_action('wp_ajax_fvc_new_listing',        'fvc_bridge_capture', 1);
+add_action('wp_ajax_nopriv_fvc_new_listing', 'fvc_bridge_capture', 1);
+add_action('wp_ajax_fvc_claim',              'fvc_bridge_capture', 1);
+add_action('wp_ajax_nopriv_fvc_claim',       'fvc_bridge_capture', 1);
+function fvc_bridge_capture() {
+    if ( ! isset($_POST['nonce']) || ! wp_verify_nonce($_POST['nonce'], 'fvc_claim_nonce') ) return;
+    $type    = (strpos(current_action(), 'fvc_claim') !== false) ? 'claim' : 'add';
+    $clinic  = sanitize_text_field($_POST['clinic_name'] ?? '');
+    $email   = sanitize_email($_POST['email'] ?? '');
+    $contact = sanitize_text_field($_POST['contact_name'] ?? '');
+    if ( ! $clinic || ! $email || ! $contact ) return;
+
+    $cand  = array(
+        'name'    => $clinic,
+        'website' => esc_url_raw($_POST['clinic_website'] ?? ''),
+        'phone'   => sanitize_text_field($_POST['phone'] ?? ''),
+        'address' => sanitize_text_field($_POST['clinic_address'] ?? ''),
+    );
+    $match = fvc_bridge_find_match($cand);
+
+    fvc_bridge_store_submission($type, array(
+        'clinic_name'       => $clinic,
+        'listing_url'       => esc_url_raw($_POST['listing_url'] ?? ''),
+        'website'           => $cand['website'],
+        'address'           => $cand['address'],
+        'contact_name'      => $contact,
+        'role'              => sanitize_text_field($_POST['role'] ?? ''),
+        'email'             => $email,
+        'phone'             => $cand['phone'],
+        'services'          => sanitize_text_field($_POST['services'] ?? ''),
+        'icbc'              => sanitize_text_field($_POST['icbc'] ?? ''),
+        'worksafe'          => sanitize_text_field($_POST['worksafe'] ?? ''),
+        'billing'           => sanitize_text_field($_POST['billing'] ?? ''),
+        'booking'           => sanitize_text_field($_POST['booking'] ?? ''),
+        'notes'             => sanitize_textarea_field($_POST['notes'] ?? ''),
+        'marketing_consent' => ! empty($_POST['marketing_consent']),
+        'matched_post_id'   => $match ? $match['post_id'] : null,
+        'match_score'       => $match ? $match['score'] : null,
+    ));
+}
+
+// REST: public duplicate check for the front-end form.
+function fvc_bridge_rest_check_dup($req) {
+    $ip = fvc_bridge_ip();
+    $k  = 'fvc_bridge_dup_rl_' . md5($ip);
+    $c  = (int) get_transient($k);
+    if ( $c > 30 ) return new WP_REST_Response(array('error' => 'rate_limited'), 429);
+    set_transient($k, $c + 1, MINUTE_IN_SECONDS);
+
+    $p = $req->get_json_params();
+    if ( ! is_array($p) ) $p = $req->get_params();
+    $match = fvc_bridge_find_match(array(
+        'name'    => $p['clinic_name'] ?? $p['name'] ?? '',
+        'website' => $p['clinic_website'] ?? $p['website'] ?? '',
+        'phone'   => $p['phone'] ?? '',
+        'address' => $p['clinic_address'] ?? $p['address'] ?? '',
+    ));
+    if ( $match ) {
+        return new WP_REST_Response(array(
+            'match'   => true,
+            'score'   => $match['score'],
+            'listing' => array('name' => $match['name'], 'url' => $match['url'], 'post_id' => $match['post_id']),
+        ), 200);
+    }
+    return new WP_REST_Response(array('match' => false), 200);
+}
+
+// REST: token-gated list of stored submissions for review tooling.
+function fvc_bridge_rest_submissions($req) {
+    global $wpdb;
+    $status = sanitize_text_field($req->get_param('status') ?: 'new');
+    $table  = fvc_bridge_table();
+    $rows   = $wpdb->get_results($wpdb->prepare(
+        "SELECT * FROM $table WHERE status = %s ORDER BY created_at DESC LIMIT 200", $status), ARRAY_A);
+    return new WP_REST_Response(array('count' => count($rows), 'submissions' => $rows), 200);
 }
 
 /* ============================================================
