@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.8.0
+ * Version: 1.9.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.8.0');
+define('FVC_BRIDGE_VERSION',    '1.9.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -45,6 +45,10 @@ function fvc_bridge_bearer_token() {
 
 // Permission callback: valid token + basic per-IP rate limit.
 function fvc_bridge_require_token() {
+    // Internal reuse from the wp-admin page (logged-in admin only, no token needed).
+    if ( ! empty($GLOBALS['fvc_bridge_internal']) && current_user_can('manage_options') ) {
+        return true;
+    }
     $ip = fvc_bridge_ip();
     $rl_key = 'fvc_bridge_rl_' . md5($ip);
     $count = (int) get_transient($rl_key);
@@ -755,13 +759,14 @@ function fvc_bridge_rest_create_listing($req) {
     if ( $sub['type'] !== 'add' ) return new WP_REST_Response(array('ok' => false, 'error' => 'only add-type submissions create listings'), 400);
     if ( $sub['status'] === 'published' ) { fvc_bridge_log('create-listing-dupe', 'id=' . $sid); return new WP_REST_Response(array('ok' => false, 'error' => 'already published', 'post_id' => (int) $sub['matched_post_id']), 409); }
 
-    // Category from the submitted services (falls back to Physiotherapy).
+    // Categories from the submitted services (a clinic can be in several).
     $services = strtolower((string) $sub['services']);
-    $cat = 0;
+    $cats = array();
     foreach ( array('physio' => 7, 'chiro' => 16, 'massage' => 17, 'naturopath' => 18, 'acupunctur' => 19) as $kw => $id ) {
-        if ( strpos($services, $kw) !== false ) { $cat = $id; break; }
+        if ( strpos($services, $kw) !== false ) $cats[] = $id;
     }
-    if ( ! $cat ) $cat = 7;
+    if ( empty($cats) ) $cats = array(7);
+    $cat = $cats[0]; // primary category
 
     $flag   = function ($v) { $v = strtolower((string) $v); return ($v === 'yes' || $v === '1') ? 1 : 0; };
     $status = (isset($p['status']) && $p['status'] === 'draft') ? 'draft' : 'publish';
@@ -779,7 +784,7 @@ function fvc_bridge_rest_create_listing($req) {
         '_search_title'            => strtolower($sub['clinic_name']),
         'post_status'              => $status,
         'post_tags'                => '',
-        'post_category'            => ',' . $cat . ',',
+        'post_category'            => ',' . implode(',', $cats) . ',',
         'default_category'         => $cat,
         'featured'                 => 0,
         'overall_rating'           => 0,
@@ -801,24 +806,26 @@ function fvc_bridge_rest_create_listing($req) {
         'enrichment_status'        => 'pending',
     ));
 
-    // Category term relationship + count.
-    $wpdb->query($wpdb->prepare("INSERT IGNORE INTO {$wpdb->prefix}term_relationships (object_id, term_taxonomy_id, term_order) VALUES (%d, %d, 0)", $post_id, $cat));
-    $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}term_taxonomy SET count = count + 1 WHERE term_taxonomy_id = %d", $cat));
+    // Category term relationships + counts (one listing can be in multiple categories).
+    foreach ( $cats as $c ) {
+        $wpdb->query($wpdb->prepare("INSERT IGNORE INTO {$wpdb->prefix}term_relationships (object_id, term_taxonomy_id, term_order) VALUES (%d, %d, 0)", $post_id, $c));
+        $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}term_taxonomy SET count = count + 1 WHERE term_taxonomy_id = %d", $c));
+    }
 
     // Mark the submission published so it can never be published twice.
     $wpdb->update($table, array('status' => 'published', 'matched_post_id' => $post_id), array('id' => $sid));
 
-    // Optional: email the clinic that they're now live (uses the submission's email).
+    // Email the clinic that they're now live (default on; pass notify:false to skip).
     $notified = false;
-    if ( ! empty($p['notify']) && $status === 'publish' && is_email($sub['email']) ) {
+    if ( ($p['notify'] ?? true) && $status === 'publish' && is_email($sub['email']) ) {
         $notified = fvc_bridge_send_live_email($sub['email'], $sub['contact_name'], $sub['clinic_name'], get_permalink($post_id));
         fvc_bridge_log('notify-live', "sid=$sid to=" . $sub['email'] . " sent=" . ($notified ? '1' : '0'));
     }
 
-    fvc_bridge_log('create-listing', "sid=$sid post=$post_id status=$status cat=$cat");
+    fvc_bridge_log('create-listing', "sid=$sid post=$post_id status=$status cats=" . implode('+', $cats));
     return new WP_REST_Response(array(
         'ok' => true, 'submission_id' => $sid, 'post_id' => $post_id,
-        'status' => $status, 'category' => $cat, 'notified' => $notified,
+        'status' => $status, 'categories' => $cats, 'notified' => $notified,
         'view' => get_permalink($post_id), 'edit' => admin_url('post.php?post=' . $post_id . '&action=edit'),
     ), 200);
 }
@@ -994,4 +1001,70 @@ function fvc_bridge_settings_page() {
     echo '<input type="password" name="gh_token" placeholder="github_pat_… or ghp_…" class="regular-text" autocomplete="off"> ';
     echo '<button class="button" type="submit">Save token</button></form>';
     echo '</div>';
+}
+
+/* ============================================================
+ *  Submissions queue (wp-admin) — publish / approve / dismiss
+ * ============================================================ */
+
+add_action('admin_menu', function () {
+    add_menu_page('FVC Submissions', 'FVC Submissions', 'manage_options', 'fvc-submissions', 'fvc_bridge_submissions_page', 'dashicons-list-view', 26);
+});
+
+// Reuse a REST endpoint from inside wp-admin (admin-gated; no token needed).
+function fvc_bridge_internal_call($method, $route, $params) {
+    $GLOBALS['fvc_bridge_internal'] = true;
+    $req = new WP_REST_Request($method, $route);
+    $req->set_body_params($params);
+    $res = rest_do_request($req);
+    $GLOBALS['fvc_bridge_internal'] = false;
+    return $res->get_data();
+}
+
+function fvc_bridge_submissions_page() {
+    if ( ! current_user_can('manage_options') ) return;
+    global $wpdb;
+    $notice = '';
+
+    if ( isset($_POST['fvc_sub_action']) && check_admin_referer('fvc_submissions') ) {
+        $sid = absint($_POST['sid'] ?? 0);
+        $act = sanitize_text_field($_POST['fvc_sub_action']);
+        if ( $act === 'publish' ) {
+            $r = fvc_bridge_internal_call('POST', '/fvc-bridge/v1/create-listing', array('submission_id' => $sid));
+            $notice = ! empty($r['ok']) ? 'Published &amp; the clinic was emailed: <a href="' . esc_url($r['view']) . '">' . esc_html($r['view']) . '</a>' : 'Error: ' . esc_html($r['error'] ?? 'unknown');
+        } elseif ( $act === 'approve' ) {
+            $r = fvc_bridge_internal_call('POST', '/fvc-bridge/v1/approve-claim', array('submission_id' => $sid));
+            $notice = ! empty($r['ok']) ? 'Approved — the owner was granted edit access and emailed.' : 'Error: ' . esc_html($r['error'] ?? 'unknown');
+        } elseif ( $act === 'dismiss' ) {
+            $wpdb->update(fvc_bridge_table(), array('status' => 'dismissed'), array('id' => $sid));
+            $notice = 'Dismissed.';
+        }
+    }
+
+    $rows = $wpdb->get_results("SELECT * FROM " . fvc_bridge_table() . " WHERE status = 'new' ORDER BY created_at DESC LIMIT 200", ARRAY_A);
+
+    echo '<div class="wrap"><h1>FVC Submissions</h1>';
+    if ( $notice ) echo '<div class="notice notice-info"><p>' . $notice . '</p></div>';
+    if ( ! $rows ) { echo '<p>No new submissions right now. &#127881;</p></div>'; return; }
+
+    echo '<table class="widefat striped"><thead><tr><th>Type</th><th>Clinic</th><th>Contact</th><th>Possible duplicate</th><th>Action</th></tr></thead><tbody>';
+    foreach ( $rows as $r ) {
+        $dup = $r['matched_post_id'] ? 'matches listing #' . (int) $r['matched_post_id'] . ' (score ' . (int) $r['match_score'] . ')' : '&mdash;';
+        echo '<tr>';
+        echo '<td><span class="dashicons ' . ($r['type'] === 'claim' ? 'dashicons-admin-users' : 'dashicons-plus') . '"></span> ' . esc_html($r['type']) . '</td>';
+        echo '<td><strong>' . esc_html($r['clinic_name']) . '</strong><br><span style="color:#666">' . esc_html($r['website']) . '</span></td>';
+        echo '<td>' . esc_html($r['contact_name']) . '<br><span style="color:#666">' . esc_html($r['email']) . '</span></td>';
+        echo '<td>' . $dup . '</td>';
+        echo '<td><form method="post" style="margin:0">';
+        wp_nonce_field('fvc_submissions');
+        echo '<input type="hidden" name="sid" value="' . (int) $r['id'] . '">';
+        if ( $r['type'] === 'add' ) {
+            echo '<button class="button button-primary" name="fvc_sub_action" value="publish">Publish</button> ';
+        } else {
+            echo '<button class="button button-primary" name="fvc_sub_action" value="approve">Approve claim</button> ';
+        }
+        echo '<button class="button" name="fvc_sub_action" value="dismiss" onclick="return confirm(\'Dismiss this submission?\')">Dismiss</button>';
+        echo '</form></td></tr>';
+    }
+    echo '</tbody></table></div>';
 }
