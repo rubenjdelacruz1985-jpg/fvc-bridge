@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.2.1
+ * Version: 1.3.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.2.1');
+define('FVC_BRIDGE_VERSION',    '1.3.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -110,6 +110,12 @@ add_action('rest_api_init', function () {
         'methods'             => 'GET',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_submissions',
+    ));
+    // Token-gated: inspect the anatomy of an existing published listing.
+    register_rest_route('fvc-bridge/v1', '/inspect-listing', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_inspect',
     ));
 });
 
@@ -560,6 +566,47 @@ function fvc_bridge_rest_submissions($req) {
     $rows   = $wpdb->get_results($wpdb->prepare(
         "SELECT * FROM $table WHERE status = %s ORDER BY created_at DESC LIMIT 200", $status), ARRAY_A);
     return new WP_REST_Response(array('count' => count($rows), 'submissions' => $rows), 200);
+}
+
+// REST: token-gated anatomy of an existing published listing, so the create
+// endpoint can be built to match GeoDirectory's exact structure.
+function fvc_bridge_rest_inspect($req) {
+    global $wpdb;
+    $pid = absint($req->get_param('post_id'));
+    if ( ! $pid ) {
+        $pid = (int) $wpdb->get_var("SELECT ID FROM {$wpdb->prefix}posts WHERE post_type='gd_place' AND post_status='publish' ORDER BY ID DESC LIMIT 1");
+    }
+    if ( ! $pid ) return new WP_REST_Response(array('error' => 'no published gd_place found'), 404);
+
+    $post   = get_post($pid, ARRAY_A);
+    $detail = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}geodir_gd_place_detail WHERE post_id = %d", $pid), ARRAY_A);
+    $terms  = $wpdb->get_results($wpdb->prepare(
+        "SELECT tt.term_taxonomy_id, tt.taxonomy, tt.count, t.term_id, t.name, t.slug
+         FROM {$wpdb->prefix}term_relationships tr
+         JOIN {$wpdb->prefix}term_taxonomy tt ON tr.term_taxonomy_id = tt.term_taxonomy_id
+         JOIN {$wpdb->prefix}terms t ON tt.term_id = t.term_id
+         WHERE tr.object_id = %d", $pid), ARRAY_A);
+    $meta_keys = $wpdb->get_col($wpdb->prepare("SELECT DISTINCT meta_key FROM {$wpdb->prefix}postmeta WHERE post_id = %d", $pid));
+
+    // Column-name list from the detail table (helps map fields precisely).
+    $columns = $wpdb->get_results("SHOW COLUMNS FROM {$wpdb->prefix}geodir_gd_place_detail", ARRAY_A);
+
+    // The full gd_placecategory taxonomy (term_taxonomy_id ↔ slug), for category mapping.
+    $categories = $wpdb->get_results(
+        "SELECT tt.term_taxonomy_id, t.term_id, t.name, t.slug
+         FROM {$wpdb->prefix}term_taxonomy tt
+         JOIN {$wpdb->prefix}terms t ON tt.term_id = t.term_id
+         WHERE tt.taxonomy = 'gd_placecategory'", ARRAY_A);
+
+    return new WP_REST_Response(array(
+        'template_post_id' => $pid,
+        'post'             => $post ? array_intersect_key($post, array_flip(array('ID','post_author','post_status','post_type','post_title','post_name','post_date','post_content'))) : null,
+        'detail_columns'   => array_map(function ($c) { return array('name' => $c['Field'], 'type' => $c['Type'], 'null' => $c['Null'], 'default' => $c['Default']); }, $columns),
+        'detail_sample'    => $detail,
+        'terms_on_sample'  => $terms,
+        'meta_keys'        => $meta_keys,
+        'all_categories'   => $categories,
+    ), 200);
 }
 
 /* ============================================================
