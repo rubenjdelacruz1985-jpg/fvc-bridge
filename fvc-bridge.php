@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.9.0
+ * Version: 1.10.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.9.0');
+define('FVC_BRIDGE_VERSION',    '1.10.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1043,13 +1043,39 @@ function fvc_bridge_submissions_page() {
 
     $rows = $wpdb->get_results("SELECT * FROM " . fvc_bridge_table() . " WHERE status = 'new' ORDER BY created_at DESC LIMIT 200", ARRAY_A);
 
+    // Flag submissions that duplicate ANOTHER pending submission (same clinic in the queue).
+    $norm = array();
+    foreach ( $rows as $i => $r ) {
+        $norm[$i] = array(
+            'name'   => fvc_bridge_norm_name($r['clinic_name']),
+            'domain' => fvc_bridge_norm_domain($r['website']),
+            'phone'  => fvc_bridge_norm_phone($r['phone']),
+        );
+    }
+    $intra = array();
+    foreach ( $rows as $i => $r ) {
+        foreach ( $rows as $j => $r2 ) {
+            if ( $i >= $j ) continue;
+            $a = $norm[$i]; $b = $norm[$j];
+            if ( ( $a['domain'] && $a['domain'] === $b['domain'] )
+              || ( $a['phone'] && $a['phone'] === $b['phone'] )
+              || ( $a['name'] && $a['name'] === $b['name'] ) ) {
+                $intra[$i][] = (int) $r2['id'];
+                $intra[$j][] = (int) $r['id'];
+            }
+        }
+    }
+
     echo '<div class="wrap"><h1>FVC Submissions</h1>';
     if ( $notice ) echo '<div class="notice notice-info"><p>' . $notice . '</p></div>';
     if ( ! $rows ) { echo '<p>No new submissions right now. &#127881;</p></div>'; return; }
 
     echo '<table class="widefat striped"><thead><tr><th>Type</th><th>Clinic</th><th>Contact</th><th>Possible duplicate</th><th>Action</th></tr></thead><tbody>';
-    foreach ( $rows as $r ) {
+    foreach ( $rows as $i => $r ) {
         $dup = $r['matched_post_id'] ? 'matches listing #' . (int) $r['matched_post_id'] . ' (score ' . (int) $r['match_score'] . ')' : '&mdash;';
+        if ( ! empty($intra[$i]) ) {
+            $dup .= '<br><span style="color:#b26a00;">&#9888; also in queue as #' . esc_html(implode(', #', array_unique($intra[$i]))) . '</span>';
+        }
         echo '<tr>';
         echo '<td><span class="dashicons ' . ($r['type'] === 'claim' ? 'dashicons-admin-users' : 'dashicons-plus') . '"></span> ' . esc_html($r['type']) . '</td>';
         echo '<td><strong>' . esc_html($r['clinic_name']) . '</strong><br><span style="color:#666">' . esc_html($r['website']) . '</span></td>';
