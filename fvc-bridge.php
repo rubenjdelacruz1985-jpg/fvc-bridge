@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.12.0
+ * Version: 1.13.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.12.0');
+define('FVC_BRIDGE_VERSION',    '1.13.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -151,7 +151,39 @@ add_action('rest_api_init', function () {
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_set_featured_image',
     ));
+    // Token-gated: list recent media-library images (to reuse existing photos).
+    register_rest_route('fvc-bridge/v1', '/media', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_media',
+    ));
 });
+
+/* ---- IndexNow: push new/updated URLs to search engines (Bing, Yandex, etc.) ---- */
+add_action('init', 'fvc_bridge_indexnow_keyfile');
+function fvc_bridge_indexnow_keyfile() {
+    $key = get_option('fvc_bridge_indexnow_key');
+    if ( ! $key ) { $key = bin2hex(random_bytes(16)); update_option('fvc_bridge_indexnow_key', $key, false); }
+    if ( ! empty($_SERVER['REQUEST_URI']) && trim(parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH), '/') === $key . '.txt' ) {
+        header('Content-Type: text/plain'); echo esc_html($key); exit;
+    }
+}
+function fvc_bridge_indexnow_ping($url) {
+    $key = get_option('fvc_bridge_indexnow_key');
+    if ( ! $key || ! $url ) return;
+    wp_remote_post('https://api.indexnow.org/indexnow', array(
+        'headers'  => array('content-type' => 'application/json'),
+        'body'     => wp_json_encode(array(
+            'host'        => 'findvancouverclinics.com',
+            'key'         => $key,
+            'keyLocation' => 'https://findvancouverclinics.com/' . $key . '.txt',
+            'urlList'     => array($url),
+        )),
+        'timeout'  => 10,
+        'blocking' => false,
+    ));
+    fvc_bridge_log('indexnow', $url);
+}
 
 // Least-privilege role for clinic owners: edit their OWN listing + upload images.
 // No publishing new posts, no deleting, no editing others' content.
@@ -834,6 +866,7 @@ function fvc_bridge_rest_create_listing($req) {
         fvc_bridge_log('notify-live', "sid=$sid to=" . $sub['email'] . " sent=" . ($notified ? '1' : '0'));
     }
 
+    if ( $status === 'publish' ) fvc_bridge_indexnow_ping(get_permalink($post_id));
     fvc_bridge_log('create-listing', "sid=$sid post=$post_id status=$status cats=" . implode('+', $cats));
     return new WP_REST_Response(array(
         'ok' => true, 'submission_id' => $sid, 'post_id' => $post_id,
@@ -950,6 +983,7 @@ function fvc_bridge_rest_publish_post($req) {
         update_post_meta($post_id, 'rank_math_description', sanitize_text_field($p['meta_description']));
     }
 
+    if ( $status === 'publish' ) fvc_bridge_indexnow_ping(get_permalink($post_id));
     fvc_bridge_log('publish-post', "post=$post_id status=$status " . ($existing ? 'updated' : 'created') . " title=$title");
     return new WP_REST_Response(array(
         'ok' => true, 'post_id' => $post_id, 'status' => $status, 'updated' => (bool) $existing,
@@ -966,11 +1000,20 @@ function fvc_bridge_rest_set_featured_image($req) {
     $p = $req->get_json_params();
     if ( ! is_array($p) ) $p = $req->get_params();
     $post_id  = absint($p['post_id'] ?? 0);
+    if ( ! $post_id || ! get_post($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'valid post_id required'), 400);
+
+    // Reuse an existing media-library image by id (from /media).
+    $att = absint($p['attachment_id'] ?? 0);
+    if ( $att && get_post($att) ) {
+        set_post_thumbnail($post_id, $att);
+        fvc_bridge_log('set-featured-image', "post=$post_id attach=$att (existing)");
+        return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'attachment_id' => $att, 'url' => wp_get_attachment_url($att)), 200);
+    }
+
     $b64      = $p['image_base64'] ?? '';
     $filename = sanitize_file_name($p['filename'] ?? 'featured.png');
     $alt      = sanitize_text_field($p['alt'] ?? '');
-    if ( ! $post_id || ! $b64 ) return new WP_REST_Response(array('ok' => false, 'error' => 'post_id and image_base64 required'), 400);
-    if ( ! get_post($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'post not found'), 404);
+    if ( ! $b64 ) return new WP_REST_Response(array('ok' => false, 'error' => 'image_base64 or attachment_id required'), 400);
 
     $data = base64_decode($b64, true);
     if ( $data === false ) return new WP_REST_Response(array('ok' => false, 'error' => 'invalid base64'), 400);
@@ -993,6 +1036,32 @@ function fvc_bridge_rest_set_featured_image($req) {
 
     fvc_bridge_log('set-featured-image', "post=$post_id attach=$attach_id");
     return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'attachment_id' => $attach_id, 'url' => wp_get_attachment_url($attach_id)), 200);
+}
+
+// REST: list recent media-library images so existing photos can be reused.
+function fvc_bridge_rest_media($req) {
+    nocache_headers();
+    $search = sanitize_text_field($req->get_param('search') ?: '');
+    $q = new WP_Query(array(
+        'post_type'      => 'attachment',
+        'post_status'    => 'inherit',
+        'post_mime_type' => 'image',
+        'posts_per_page' => 80,
+        'orderby'        => 'date',
+        'order'          => 'DESC',
+        's'              => $search,
+    ));
+    $out = array();
+    foreach ( $q->posts as $a ) {
+        $out[] = array(
+            'id'    => $a->ID,
+            'title' => $a->post_title,
+            'alt'   => get_post_meta($a->ID, '_wp_attachment_image_alt', true),
+            'file'  => basename(get_attached_file($a->ID)),
+            'url'   => wp_get_attachment_url($a->ID),
+        );
+    }
+    return new WP_REST_Response(array('count' => count($out), 'media' => $out), 200);
 }
 
 // -- "You can now manage your listing" email (claim approved) --
