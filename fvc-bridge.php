@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.1.0');
+define('FVC_BRIDGE_VERSION',    '1.2.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -362,46 +362,155 @@ function fvc_bridge_store_submission($type, $data) {
     return (int) $wpdb->insert_id;
 }
 
-// Capture both existing forms (priority 1, does not exit — the real handler still runs).
-add_action('wp_ajax_fvc_new_listing',        'fvc_bridge_capture', 1);
-add_action('wp_ajax_nopriv_fvc_new_listing', 'fvc_bridge_capture', 1);
-add_action('wp_ajax_fvc_claim',              'fvc_bridge_capture', 1);
-add_action('wp_ajax_nopriv_fvc_claim',       'fvc_bridge_capture', 1);
-function fvc_bridge_capture() {
-    if ( ! isset($_POST['nonce']) || ! wp_verify_nonce($_POST['nonce'], 'fvc_claim_nonce') ) return;
-    $type    = (strpos(current_action(), 'fvc_claim') !== false) ? 'claim' : 'add';
-    $clinic  = sanitize_text_field($_POST['clinic_name'] ?? '');
-    $email   = sanitize_email($_POST['email'] ?? '');
-    $contact = sanitize_text_field($_POST['contact_name'] ?? '');
-    if ( ! $clinic || ! $email || ! $contact ) return;
+/* ---- Form handlers owned by the bridge (disable WPCode #1071 & #1015) ---- */
+// Unique function names so there's no fatal clash if a WPCode snippet lingers.
 
-    $cand  = array(
-        'name'    => $clinic,
-        'website' => esc_url_raw($_POST['clinic_website'] ?? ''),
-        'phone'   => sanitize_text_field($_POST['phone'] ?? ''),
-        'address' => sanitize_text_field($_POST['clinic_address'] ?? ''),
-    );
-    $match = fvc_bridge_find_match($cand);
+// Keep the forms' nonce available even after the WPCode snippets are disabled.
+add_action('wp_footer', function () {
+    echo '<script>window.fvcAjax = { url: "' . esc_url(admin_url('admin-ajax.php')) . '", nonce: "' . esc_js(wp_create_nonce('fvc_claim_nonce')) . '" };</script>';
+});
 
-    fvc_bridge_store_submission($type, array(
-        'clinic_name'       => $clinic,
-        'listing_url'       => esc_url_raw($_POST['listing_url'] ?? ''),
-        'website'           => $cand['website'],
-        'address'           => $cand['address'],
-        'contact_name'      => $contact,
-        'role'              => sanitize_text_field($_POST['role'] ?? ''),
-        'email'             => $email,
-        'phone'             => $cand['phone'],
-        'services'          => sanitize_text_field($_POST['services'] ?? ''),
-        'icbc'              => sanitize_text_field($_POST['icbc'] ?? ''),
-        'worksafe'          => sanitize_text_field($_POST['worksafe'] ?? ''),
-        'billing'           => sanitize_text_field($_POST['billing'] ?? ''),
-        'booking'           => sanitize_text_field($_POST['booking'] ?? ''),
-        'notes'             => sanitize_textarea_field($_POST['notes'] ?? ''),
-        'marketing_consent' => ! empty($_POST['marketing_consent']),
-        'matched_post_id'   => $match ? $match['post_id'] : null,
-        'match_score'       => $match ? $match['score'] : null,
+function fvc_bridge_brevo_key() {
+    return defined('FVC_BREVO_API_KEY') ? (string) FVC_BREVO_API_KEY : '';
+}
+
+function fvc_bridge_email_shell($preheader, $heading, $inner_html) {
+    return '<div style="display:none;max-height:0;overflow:hidden;opacity:0;">' . esc_html($preheader) . '</div>'
+    . '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:24px 0;font-family:Segoe UI,Helvetica,Arial,sans-serif;"><tr><td align="center">'
+    . '<table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#fff;border-radius:12px;overflow:hidden;">'
+    . '<tr><td style="background:#09090B;padding:26px 32px;"><span style="color:#fff;font-size:20px;font-weight:700;">Find Vancouver Clinics</span><span style="color:#09BDB8;font-size:20px;font-weight:700;"> &#10003;</span></td></tr>'
+    . '<tr><td style="height:4px;background:#09BDB8;font-size:0;line-height:0;">&nbsp;</td></tr>'
+    . '<tr><td style="padding:34px 32px 8px;"><h1 style="margin:0 0 14px;font-size:23px;line-height:1.25;color:#09090B;">' . $heading . '</h1>' . $inner_html
+    . '<p style="margin:14px 0 0;font-size:14px;color:#6b6b6e;">&mdash; The Find Vancouver Clinics team</p></td></tr>'
+    . '<tr><td style="padding:22px 32px;background:#fafafa;border-top:1px solid #eee;"><p style="margin:0;font-size:12px;line-height:1.5;color:#9ca3af;">Find Vancouver Clinics &middot; Vancouver, BC<br>You received this because you contacted us at <a href="https://findvancouverclinics.com" style="color:#6b6b6e;">findvancouverclinics.com</a>.</p></td></tr>'
+    . '</table></td></tr></table>';
+}
+
+function fvc_bridge_send_brevo($email, $contact_name, $attrs) {
+    $key = fvc_bridge_brevo_key();
+    if ( ! $key ) return;
+    $name_parts = explode(' ', $contact_name, 2);
+    wp_remote_post('https://api.brevo.com/v3/contacts', array(
+        'headers' => array('accept' => 'application/json', 'content-type' => 'application/json', 'api-key' => $key),
+        'body'    => json_encode(array(
+            'email' => $email, 'listIds' => array(4), 'updateEnabled' => true,
+            'attributes' => array_merge(array('FIRSTNAME' => $name_parts[0], 'LASTNAME' => isset($name_parts[1]) ? $name_parts[1] : ''), $attrs),
+        )),
+        'timeout' => 15,
     ));
+}
+
+function fvc_bridge_collect_post() {
+    return array(
+        'clinic_name' => sanitize_text_field($_POST['clinic_name'] ?? ''),
+        'website'     => esc_url_raw($_POST['clinic_website'] ?? ''),
+        'address'     => sanitize_text_field($_POST['clinic_address'] ?? ''),
+        'listing_url' => esc_url_raw($_POST['listing_url'] ?? ''),
+        'contact'     => sanitize_text_field($_POST['contact_name'] ?? ''),
+        'role'        => sanitize_text_field($_POST['role'] ?? ''),
+        'email'       => sanitize_email($_POST['email'] ?? ''),
+        'phone'       => sanitize_text_field($_POST['phone'] ?? ''),
+        'services'    => sanitize_text_field($_POST['services'] ?? 'Not specified'),
+        'icbc'        => sanitize_text_field($_POST['icbc'] ?? 'Not answered'),
+        'worksafe'    => sanitize_text_field($_POST['worksafe'] ?? 'Not answered'),
+        'billing'     => sanitize_text_field($_POST['billing'] ?? 'Not answered'),
+        'booking'     => sanitize_text_field($_POST['booking'] ?? 'Not answered'),
+        'notes'       => sanitize_textarea_field($_POST['notes'] ?? ''),
+        'consent'     => ! empty($_POST['marketing_consent']),
+    );
+}
+
+add_action('wp_ajax_fvc_new_listing',        'fvc_bridge_new_listing_handler');
+add_action('wp_ajax_nopriv_fvc_new_listing', 'fvc_bridge_new_listing_handler');
+function fvc_bridge_new_listing_handler() {
+    if ( ! isset($_POST['nonce']) || ! wp_verify_nonce($_POST['nonce'], 'fvc_claim_nonce') ) { wp_send_json_error('Invalid request'); }
+    $d = fvc_bridge_collect_post();
+    if ( ! $d['clinic_name'] || ! $d['email'] || ! $d['contact'] ) { wp_send_json_error('Missing required fields'); }
+
+    $match = fvc_bridge_find_match(array('name' => $d['clinic_name'], 'website' => $d['website'], 'phone' => $d['phone'], 'address' => $d['address']));
+    fvc_bridge_store_submission('add', array(
+        'clinic_name' => $d['clinic_name'], 'website' => $d['website'], 'address' => $d['address'],
+        'contact_name' => $d['contact'], 'role' => $d['role'], 'email' => $d['email'], 'phone' => $d['phone'],
+        'services' => $d['services'], 'icbc' => $d['icbc'], 'worksafe' => $d['worksafe'], 'billing' => $d['billing'], 'booking' => $d['booking'],
+        'notes' => $d['notes'], 'marketing_consent' => $d['consent'],
+        'matched_post_id' => $match ? $match['post_id'] : null, 'match_score' => $match ? $match['score'] : null,
+    ));
+
+    $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>', 'Reply-To: ' . $d['contact'] . ' <' . $d['email'] . '>');
+    $admin = '<h2>New Listing Request</h2><ul>'
+        . '<li>Clinic: ' . esc_html($d['clinic_name']) . '</li>'
+        . '<li>Website: ' . esc_html($d['website']) . '</li>'
+        . '<li>Address: ' . esc_html($d['address']) . '</li>'
+        . '<li>Contact: ' . esc_html($d['contact']) . ' (' . esc_html($d['role']) . ')</li>'
+        . '<li>Email: ' . esc_html($d['email']) . ' | Phone: ' . esc_html($d['phone']) . '</li>'
+        . '<li>Services: ' . esc_html($d['services']) . '</li>'
+        . '<li>ICBC/WSBC: ' . esc_html($d['icbc']) . ' / ' . esc_html($d['worksafe']) . ' | Billing/Booking: ' . esc_html($d['billing']) . ' / ' . esc_html($d['booking']) . '</li>'
+        . '<li>Marketing consent: ' . ($d['consent'] ? 'Yes' : 'No') . '</li>'
+        . ($match ? '<li><strong>Possible duplicate:</strong> ' . esc_html($match['name']) . ' (score ' . $match['score'] . ') ' . esc_url($match['url']) . '</li>' : '')
+        . ($d['notes'] ? '<li>Notes: ' . esc_html($d['notes']) . '</li>' : '') . '</ul>';
+    $sent = wp_mail('claim@findvancouverclinics.com', 'New Listing Request: ' . $d['clinic_name'], $admin, $headers);
+
+    $confirm = fvc_bridge_email_shell(
+        'Your clinic is in our review queue - live within 48 hours.',
+        'Thanks, ' . esc_html($d['contact']) . ' - we&#39;ve got it.',
+        '<p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#3f3f46;">We received your submission for <strong>' . esc_html($d['clinic_name']) . '</strong>. It&#39;s now in our review queue.</p>'
+        . '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 24px;">'
+        . '<tr><td style="padding:10px 0;border-bottom:1px solid #eee;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">1.</span>&nbsp; We review your details for accuracy.</td></tr>'
+        . '<tr><td style="padding:10px 0;border-bottom:1px solid #eee;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">2.</span>&nbsp; Your clinic goes live - usually within <strong>48 hours</strong>.</td></tr>'
+        . '<tr><td style="padding:10px 0;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">3.</span>&nbsp; We email you the link the moment it&#39;s published.</td></tr></table>'
+        . '<table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#09BDB8;"><a href="https://findvancouverclinics.com/places/" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#fff;text-decoration:none;">Browse the directory &rarr;</a></td></tr></table>'
+    );
+    wp_mail($d['email'], 'We received your listing request - Find Vancouver Clinics', $confirm, $headers);
+
+    if ( $d['consent'] ) {
+        fvc_bridge_send_brevo($d['email'], $d['contact'], array('CLINIC_NAME' => $d['clinic_name'], 'ROLE' => $d['role'], 'CLAIM_STATUS' => 'new_listing', 'SERVICES' => $d['services'], 'ICBC_APPROVED' => $d['icbc'], 'WORKSAFE_APPROVED' => $d['worksafe'], 'DIRECT_BILLING' => $d['billing'], 'ONLINE_BOOKING' => $d['booking']));
+    }
+    $sent ? wp_send_json_success('Listing request submitted') : wp_send_json_error('Mail failed');
+}
+
+add_action('wp_ajax_fvc_claim',        'fvc_bridge_claim_handler');
+add_action('wp_ajax_nopriv_fvc_claim', 'fvc_bridge_claim_handler');
+function fvc_bridge_claim_handler() {
+    if ( ! isset($_POST['nonce']) || ! wp_verify_nonce($_POST['nonce'], 'fvc_claim_nonce') ) { wp_send_json_error('Invalid request'); }
+    $d = fvc_bridge_collect_post();
+    if ( ! $d['clinic_name'] || ! $d['email'] || ! $d['contact'] ) { wp_send_json_error('Missing required fields'); }
+
+    $match = fvc_bridge_find_match(array('name' => $d['clinic_name']));
+    fvc_bridge_store_submission('claim', array(
+        'clinic_name' => $d['clinic_name'], 'listing_url' => $d['listing_url'],
+        'contact_name' => $d['contact'], 'role' => $d['role'], 'email' => $d['email'], 'phone' => $d['phone'],
+        'services' => $d['services'], 'icbc' => $d['icbc'], 'worksafe' => $d['worksafe'], 'billing' => $d['billing'], 'booking' => $d['booking'],
+        'notes' => $d['notes'], 'marketing_consent' => $d['consent'],
+        'matched_post_id' => $match ? $match['post_id'] : null, 'match_score' => $match ? $match['score'] : null,
+    ));
+
+    $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>', 'Reply-To: ' . $d['contact'] . ' <' . $d['email'] . '>');
+    $admin_link = $match ? '<li>Edit: ' . esc_url(admin_url('post.php?post=' . $match['post_id'] . '&action=edit')) . '</li>' : '';
+    $admin = '<h2>New Claim Request</h2><ul>'
+        . '<li>Clinic: ' . esc_html($d['clinic_name']) . '</li>'
+        . ($d['listing_url'] ? '<li>Listing: ' . esc_html($d['listing_url']) . '</li>' : '')
+        . $admin_link
+        . '<li>Contact: ' . esc_html($d['contact']) . ' (' . esc_html($d['role']) . ')</li>'
+        . '<li>Email: ' . esc_html($d['email']) . ' | Phone: ' . esc_html($d['phone']) . '</li>'
+        . '<li>Marketing consent: ' . ($d['consent'] ? 'Yes' : 'No') . '</li>'
+        . ($d['notes'] ? '<li>Notes: ' . esc_html($d['notes']) . '</li>' : '') . '</ul>';
+    $sent = wp_mail('claim@findvancouverclinics.com', 'New Claim Request: ' . $d['clinic_name'], $admin, $headers);
+
+    $confirm = fvc_bridge_email_shell(
+        'Claim request received',
+        'Thanks, ' . esc_html($d['contact']) . ' - we&#39;ve got it.',
+        '<p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#3f3f46;">We received your request to claim <strong>' . esc_html($d['clinic_name']) . '</strong>. Here&#39;s what happens next:</p>'
+        . '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:8px 0 24px;">'
+        . '<tr><td style="padding:10px 0;border-bottom:1px solid #eee;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">1.</span>&nbsp; We verify you&#39;re connected to the clinic.</td></tr>'
+        . '<tr><td style="padding:10px 0;border-bottom:1px solid #eee;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">2.</span>&nbsp; We reach out within <strong>1-2 business days</strong>.</td></tr>'
+        . '<tr><td style="padding:10px 0;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">3.</span>&nbsp; Once confirmed, you get access to manage your listing.</td></tr></table>'
+    );
+    wp_mail($d['email'], 'We received your claim request - Find Vancouver Clinics', $confirm, $headers);
+
+    if ( $d['consent'] ) {
+        fvc_bridge_send_brevo($d['email'], $d['contact'], array('CLINIC_NAME' => $d['clinic_name'], 'ROLE' => $d['role'], 'CLAIM_STATUS' => 'pending', 'SERVICES' => $d['services'], 'ICBC_APPROVED' => $d['icbc'], 'WORKSAFE_APPROVED' => $d['worksafe'], 'DIRECT_BILLING' => $d['billing'], 'ONLINE_BOOKING' => $d['booking']));
+    }
+    $sent ? wp_send_json_success('Claim submitted') : wp_send_json_error('Mail failed');
 }
 
 // REST: public duplicate check for the front-end form.
