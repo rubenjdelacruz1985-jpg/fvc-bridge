@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.10.0
+ * Version: 1.11.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.10.0');
+define('FVC_BRIDGE_VERSION',    '1.11.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -138,6 +138,12 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_approve_claim',
+    ));
+    // Token-gated: publish a blog post (SEO content).
+    register_rest_route('fvc-bridge/v1', '/publish-post', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_publish_post',
     ));
 });
 
@@ -904,6 +910,44 @@ function fvc_bridge_rest_approve_claim($req) {
     return new WP_REST_Response(array(
         'ok' => true, 'submission_id' => $sid, 'user_id' => $user->ID,
         'post_id' => $listing_id, 'new_user' => $new_user, 'view' => get_permalink($listing_id),
+    ), 200);
+}
+
+// REST: publish a blog post (SEO content). Idempotent-ish by slug (updates an
+// existing post with the same slug instead of creating duplicates).
+function fvc_bridge_rest_publish_post($req) {
+    $p = $req->get_json_params();
+    if ( ! is_array($p) ) $p = $req->get_params();
+    $title   = sanitize_text_field($p['title'] ?? '');
+    $content = isset($p['content']) ? wp_kses_post($p['content']) : '';
+    if ( ! $title || ! $content ) return new WP_REST_Response(array('ok' => false, 'error' => 'title and content required'), 400);
+
+    $status = (isset($p['status']) && $p['status'] === 'draft') ? 'draft' : 'publish';
+    $slug   = ! empty($p['slug']) ? sanitize_title($p['slug']) : sanitize_title($title);
+
+    $existing = get_page_by_path($slug, OBJECT, 'post');
+    $postarr = array(
+        'post_type'    => 'post',
+        'post_status'  => $status,
+        'post_title'   => $title,
+        'post_content' => $content,
+        'post_excerpt' => sanitize_text_field($p['excerpt'] ?? ''),
+        'post_name'    => $slug,
+        'post_author'  => 1,
+    );
+    if ( $existing ) $postarr['ID'] = $existing->ID;
+
+    $post_id = wp_insert_post($postarr, true);
+    if ( is_wp_error($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => $post_id->get_error_message()), 500);
+
+    if ( ! empty($p['meta_description']) && function_exists('update_post_meta') ) {
+        update_post_meta($post_id, 'rank_math_description', sanitize_text_field($p['meta_description']));
+    }
+
+    fvc_bridge_log('publish-post', "post=$post_id status=$status " . ($existing ? 'updated' : 'created') . " title=$title");
+    return new WP_REST_Response(array(
+        'ok' => true, 'post_id' => $post_id, 'status' => $status, 'updated' => (bool) $existing,
+        'view' => get_permalink($post_id), 'edit' => admin_url('post.php?post=' . $post_id . '&action=edit'),
     ), 200);
 }
 
