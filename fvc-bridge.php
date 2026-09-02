@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.7.0
+ * Version: 1.8.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.7.0');
+define('FVC_BRIDGE_VERSION',    '1.8.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -427,6 +427,40 @@ function fvc_bridge_store_submission($type, $data) {
 add_action('wp_footer', function () {
     echo '<script>window.fvcAjax = { url: "' . esc_url(admin_url('admin-ajax.php')) . '", nonce: "' . esc_js(wp_create_nonce('fvc_claim_nonce')) . '" };</script>';
 });
+
+// CASL consent checkbox — injected into the clinic add/claim forms, and wired
+// into their fetch() POST so marketing_consent is included only when ticked.
+add_action('wp_footer', 'fvc_bridge_consent_injection');
+function fvc_bridge_consent_injection() {
+    echo <<<'HTML'
+<script>(function(){
+  function addConsent(){
+    if (!document.getElementById('fvc-clinic-name') && !document.getElementById('fvc-email')) return;
+    document.querySelectorAll('.fvc-submit-btn').forEach(function(btn){
+      if (!btn.parentNode || document.getElementById('fvc-marketing-consent')) return;
+      var w = document.createElement('label');
+      w.style.cssText = 'display:flex;gap:8px;align-items:flex-start;font-size:14px;margin:14px 0;line-height:1.5;text-align:left;';
+      w.innerHTML = '<input type="checkbox" id="fvc-marketing-consent" style="margin-top:3px;flex:none;"><span>Keep me updated with occasional news from Find Vancouver Clinics. See our <a href="/privacy-policy/">Privacy Policy</a>.</span>';
+      btn.parentNode.insertBefore(w, btn);
+    });
+  }
+  if (document.readyState !== 'loading') addConsent(); else document.addEventListener('DOMContentLoaded', addConsent);
+  var of = window.fetch;
+  window.fetch = function(u, o){
+    try {
+      if (o && o.body instanceof FormData) {
+        var a = o.body.get('action');
+        if ((a === 'fvc_new_listing' || a === 'fvc_claim') && !o.body.has('marketing_consent')) {
+          var cb = document.getElementById('fvc-marketing-consent');
+          o.body.append('marketing_consent', (cb && cb.checked) ? '1' : '');
+        }
+      }
+    } catch(e){}
+    return of.apply(this, arguments);
+  };
+})();</script>
+HTML;
+}
 
 // Suppress the legacy WPCode handlers at runtime (priority 0, before they fire),
 // so the bridge is the sole handler even if snippets #1071/#1015 are still active.
