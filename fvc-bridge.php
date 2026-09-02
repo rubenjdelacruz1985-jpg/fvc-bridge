@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.13.0
+ * Version: 1.14.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.13.0');
+define('FVC_BRIDGE_VERSION',    '1.14.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -979,6 +979,10 @@ function fvc_bridge_rest_publish_post($req) {
     $post_id = wp_insert_post($postarr, true);
     if ( is_wp_error($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => $post_id->get_error_message()), 500);
 
+    if ( ! empty($p['category']) ) {
+        $cat = is_numeric($p['category']) ? (int) $p['category'] : get_cat_ID(sanitize_text_field($p['category']));
+        if ( $cat ) wp_set_post_categories($post_id, array($cat));
+    }
     if ( ! empty($p['meta_description']) && function_exists('update_post_meta') ) {
         update_post_meta($post_id, 'rank_math_description', sanitize_text_field($p['meta_description']));
     }
