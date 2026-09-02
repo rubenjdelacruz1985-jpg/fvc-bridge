@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.5.0
+ * Version: 1.6.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.5.0');
+define('FVC_BRIDGE_VERSION',    '1.6.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -129,7 +129,26 @@ add_action('rest_api_init', function () {
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_notify_live',
     ));
+    // Token-gated: approve a stored CLAIM by ID — grants the owner edit access.
+    register_rest_route('fvc-bridge/v1', '/approve-claim', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_approve_claim',
+    ));
 });
+
+// Least-privilege role for clinic owners: edit their OWN listing + upload images.
+// No publishing new posts, no deleting, no editing others' content.
+add_action('init', 'fvc_bridge_register_owner_role');
+function fvc_bridge_register_owner_role() {
+    if ( get_role('fvc_clinic_owner') ) return;
+    add_role('fvc_clinic_owner', 'Clinic Owner', array(
+        'read'                 => true,
+        'edit_posts'           => true,
+        'edit_published_posts' => true,
+        'upload_files'         => true,
+    ));
+}
 
 function fvc_bridge_rest_health() {
     nocache_headers(); // don't let the host proxy-cache this (stale version reads)
@@ -207,6 +226,20 @@ function fvc_bridge_get_manifest($force = false) {
     if ( ! is_array($data) ) $data = false;
     set_site_transient('fvc_bridge_manifest', $data, 6 * HOUR_IN_SECONDS);
     return $data;
+}
+
+// Authenticate GitHub requests for our repo (manifest + release zip) when a token
+// is set, so self-update keeps working even if the repo is made private.
+// Set the token in wp-config.php:  define('FVC_GH_TOKEN', 'ghp_or_fine_grained_token');
+add_filter('http_request_args', 'fvc_bridge_github_auth', 10, 2);
+function fvc_bridge_github_auth($args, $url) {
+    if ( defined('FVC_GH_TOKEN') && FVC_GH_TOKEN
+        && ( strpos($url, 'github.com/rubenjdelacruz1985-jpg/fvc-bridge') !== false
+          || strpos($url, 'api.github.com/repos/rubenjdelacruz1985-jpg/fvc-bridge') !== false ) ) {
+        if ( empty($args['headers']) || ! is_array($args['headers']) ) $args['headers'] = array();
+        $args['headers']['Authorization'] = 'token ' . FVC_GH_TOKEN;
+    }
+    return $args;
 }
 
 // Fires for every plugin whose "Update URI" host is github.com — we only act on ours.
@@ -767,6 +800,79 @@ function fvc_bridge_rest_notify_live($req) {
     $sent = fvc_bridge_send_live_email($email, $contact, $post->post_title, get_permalink($post_id));
     fvc_bridge_log('notify-live-manual', "post=$post_id to=$email sent=" . ($sent ? '1' : '0'));
     return new WP_REST_Response(array('ok' => (bool) $sent, 'post_id' => $post_id, 'to' => $email), 200);
+}
+
+// REST: approve a stored CLAIM by ID — give the owner edit access to that listing.
+// Creates a least-privilege user if needed (they set their own password via WP),
+// makes them the listing's author, marks the claim approved, and emails them.
+function fvc_bridge_rest_approve_claim($req) {
+    global $wpdb;
+    require_once ABSPATH . 'wp-admin/includes/user.php';
+
+    $p = $req->get_json_params();
+    if ( ! is_array($p) ) $p = $req->get_params();
+    $sid = absint($p['submission_id'] ?? 0);
+    if ( ! $sid ) return new WP_REST_Response(array('ok' => false, 'error' => 'submission_id required'), 400);
+
+    $table = fvc_bridge_table();
+    $sub = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d", $sid), ARRAY_A);
+    if ( ! $sub ) return new WP_REST_Response(array('ok' => false, 'error' => 'submission not found'), 404);
+    if ( $sub['type'] !== 'claim' ) return new WP_REST_Response(array('ok' => false, 'error' => 'only claim submissions can be approved'), 400);
+    if ( $sub['status'] === 'approved' ) return new WP_REST_Response(array('ok' => false, 'error' => 'already approved'), 409);
+
+    $listing_id = absint($sub['matched_post_id']);
+    if ( ! $listing_id ) {
+        $m = fvc_bridge_find_match(array('name' => $sub['clinic_name']));
+        if ( $m ) $listing_id = (int) $m['post_id'];
+    }
+    if ( ! $listing_id ) return new WP_REST_Response(array('ok' => false, 'error' => 'no matching listing to claim'), 400);
+
+    $email = sanitize_email($sub['email']);
+    if ( ! is_email($email) ) return new WP_REST_Response(array('ok' => false, 'error' => 'submission has no valid email'), 400);
+
+    $user     = get_user_by('email', $email);
+    $new_user = false;
+    if ( ! $user ) {
+        $uid = wp_insert_user(array(
+            'user_login'   => $email,
+            'user_email'   => $email,
+            'user_pass'    => wp_generate_password(24, true, true),
+            'display_name' => $sub['contact_name'] ? $sub['contact_name'] : $email,
+            'role'         => 'fvc_clinic_owner',
+        ));
+        if ( is_wp_error($uid) ) return new WP_REST_Response(array('ok' => false, 'error' => $uid->get_error_message()), 500);
+        $new_user = true;
+        wp_new_user_notification($uid, null, 'user'); // WP sends a "set your password" link; we never handle the password.
+        $user = get_user_by('id', $uid);
+    }
+
+    // Make them the listing's author so they can edit it. We never change an
+    // existing user's role here (so an admin who happens to match isn't downgraded).
+    wp_update_post(array('ID' => $listing_id, 'post_author' => $user->ID));
+    $wpdb->update($table, array('status' => 'approved', 'matched_post_id' => $listing_id), array('id' => $sid));
+
+    fvc_bridge_send_claim_approved($email, $sub['contact_name'], $sub['clinic_name'], get_permalink($listing_id), $new_user);
+    fvc_bridge_log('approve-claim', "sid=$sid user={$user->ID} post=$listing_id new_user=" . ($new_user ? '1' : '0'));
+
+    return new WP_REST_Response(array(
+        'ok' => true, 'submission_id' => $sid, 'user_id' => $user->ID,
+        'post_id' => $listing_id, 'new_user' => $new_user, 'view' => get_permalink($listing_id),
+    ), 200);
+}
+
+// -- "You can now manage your listing" email (claim approved) --
+function fvc_bridge_send_claim_approved($to, $contact, $clinic, $view_url, $new_user) {
+    if ( ! is_email($to) ) return false;
+    $setup = $new_user
+        ? '<p style="margin:0 0 8px;font-size:14px;line-height:1.6;color:#3f3f46;">We&#39;ve set up your account. Look for a separate email from us to <strong>set your password</strong>, then sign in to edit your listing.</p>'
+        : '<p style="margin:0 0 8px;font-size:14px;line-height:1.6;color:#3f3f46;">Sign in with your existing account to edit your listing.</p>';
+    $inner =
+        '<p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#3f3f46;">You&#39;re verified, ' . esc_html($contact) . ' — you now have access to manage <strong>' . esc_html($clinic) . '</strong> on Find Vancouver Clinics.</p>'
+      . $setup
+      . '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:12px 0 8px;"><tr><td style="border-radius:8px;background:#09BDB8;"><a href="' . esc_url($view_url) . '" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#fff;text-decoration:none;">View your listing &rarr;</a></td></tr></table>'
+      . '<p style="margin:12px 0 0;font-size:13px;color:#6b6b6e;">Sign in at <a href="https://findvancouverclinics.com/wp-login.php" style="color:#0a8f8b;">findvancouverclinics.com/wp-login.php</a> to update your hours, services, and details.</p>';
+    $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>', 'Reply-To: Find Vancouver Clinics <claim@findvancouverclinics.com>');
+    return wp_mail($to, 'You can now manage your listing on Find Vancouver Clinics', fvc_bridge_email_shell('You&#39;re verified — you can now manage your listing.', 'You&#39;re verified, ' . esc_html($contact) . '.', $inner), $headers);
 }
 
 /* ============================================================
