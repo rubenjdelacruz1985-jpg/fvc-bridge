@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.2.0');
+define('FVC_BRIDGE_VERSION',    '1.2.1');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -369,6 +369,19 @@ function fvc_bridge_store_submission($type, $data) {
 add_action('wp_footer', function () {
     echo '<script>window.fvcAjax = { url: "' . esc_url(admin_url('admin-ajax.php')) . '", nonce: "' . esc_js(wp_create_nonce('fvc_claim_nonce')) . '" };</script>';
 });
+
+// Suppress the legacy WPCode handlers at runtime (priority 0, before they fire),
+// so the bridge is the sole handler even if snippets #1071/#1015 are still active.
+add_action('wp_ajax_fvc_new_listing',        'fvc_bridge_suppress_legacy', 0);
+add_action('wp_ajax_nopriv_fvc_new_listing', 'fvc_bridge_suppress_legacy', 0);
+add_action('wp_ajax_fvc_claim',              'fvc_bridge_suppress_legacy', 0);
+add_action('wp_ajax_nopriv_fvc_claim',       'fvc_bridge_suppress_legacy', 0);
+function fvc_bridge_suppress_legacy() {
+    remove_action('wp_ajax_fvc_new_listing',        'fvc_handle_new_listing');
+    remove_action('wp_ajax_nopriv_fvc_new_listing', 'fvc_handle_new_listing');
+    remove_action('wp_ajax_fvc_claim',              'fvc_handle_claim');
+    remove_action('wp_ajax_nopriv_fvc_claim',       'fvc_handle_claim');
+}
 
 function fvc_bridge_brevo_key() {
     return defined('FVC_BREVO_API_KEY') ? (string) FVC_BREVO_API_KEY : '';
