@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.6.0
+ * Version: 1.7.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.6.0');
+define('FVC_BRIDGE_VERSION',    '1.7.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -232,12 +232,18 @@ function fvc_bridge_get_manifest($force = false) {
 // is set, so self-update keeps working even if the repo is made private.
 // Set the token in wp-config.php:  define('FVC_GH_TOKEN', 'ghp_or_fine_grained_token');
 add_filter('http_request_args', 'fvc_bridge_github_auth', 10, 2);
+// Token from a wp-config constant OR the Settings screen option (set in wp-admin).
+function fvc_bridge_gh_token() {
+    if ( defined('FVC_GH_TOKEN') && FVC_GH_TOKEN ) return FVC_GH_TOKEN;
+    return (string) get_option('fvc_bridge_gh_token', '');
+}
 function fvc_bridge_github_auth($args, $url) {
-    if ( defined('FVC_GH_TOKEN') && FVC_GH_TOKEN
+    $tok = fvc_bridge_gh_token();
+    if ( $tok
         && ( strpos($url, 'github.com/rubenjdelacruz1985-jpg/fvc-bridge') !== false
           || strpos($url, 'api.github.com/repos/rubenjdelacruz1985-jpg/fvc-bridge') !== false ) ) {
         if ( empty($args['headers']) || ! is_array($args['headers']) ) $args['headers'] = array();
-        $args['headers']['Authorization'] = 'token ' . FVC_GH_TOKEN;
+        $args['headers']['Authorization'] = 'token ' . $tok;
     }
     return $args;
 }
@@ -908,6 +914,9 @@ function fvc_bridge_settings_page() {
                 unset($tokens[$idx]);
                 update_option('fvc_bridge_tokens', array_values($tokens), false);
             }
+        } elseif ( $_POST['fvc_bridge_action'] === 'save_gh_token' ) {
+            update_option('fvc_bridge_gh_token', sanitize_text_field($_POST['gh_token'] ?? ''), false);
+            fvc_bridge_log('gh-token-set', '');
         }
     }
 
@@ -940,5 +949,15 @@ function fvc_bridge_settings_page() {
     echo '<input type="hidden" name="fvc_bridge_action" value="generate">';
     echo '<input type="text" name="label" placeholder="e.g. claude-manager" class="regular-text"> ';
     echo '<button class="button button-primary" type="submit">Generate</button></form>';
+
+    // GitHub token — lets self-update work if the repo is made private.
+    $gh_set = fvc_bridge_gh_token() ? 'Set &#10003;' : 'Not set';
+    echo '<hr><h2>GitHub token <span style="font-weight:400;color:#666;">(only needed if the plugin repo is private)</span></h2>';
+    echo '<p>Status: <strong>' . $gh_set . '</strong>. Paste a GitHub <em>fine-grained</em> token with <strong>Contents: Read-only</strong> on the <code>fvc-bridge</code> repo. Stored server-side; never shown again.</p>';
+    echo '<form method="post">';
+    wp_nonce_field('fvc_bridge_settings');
+    echo '<input type="hidden" name="fvc_bridge_action" value="save_gh_token">';
+    echo '<input type="password" name="gh_token" placeholder="github_pat_… or ghp_…" class="regular-text" autocomplete="off"> ';
+    echo '<button class="button" type="submit">Save token</button></form>';
     echo '</div>';
 }
