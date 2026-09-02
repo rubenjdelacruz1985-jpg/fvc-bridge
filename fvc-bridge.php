@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.3.0
+ * Version: 1.4.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.3.0');
+define('FVC_BRIDGE_VERSION',    '1.4.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -116,6 +116,12 @@ add_action('rest_api_init', function () {
         'methods'             => 'GET',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_inspect',
+    ));
+    // Token-gated: publish an already-stored, approved submission BY ID.
+    register_rest_route('fvc-bridge/v1', '/create-listing', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_create_listing',
     ));
 });
 
@@ -606,6 +612,91 @@ function fvc_bridge_rest_inspect($req) {
         'terms_on_sample'  => $terms,
         'meta_keys'        => $meta_keys,
         'all_categories'   => $categories,
+    ), 200);
+}
+
+// REST: publish a stored, approved submission BY ID into a live GeoDirectory
+// listing. Never accepts listing content in the request — only the id; all
+// data comes from the bridge's own store. Idempotent (won't publish twice).
+function fvc_bridge_rest_create_listing($req) {
+    global $wpdb;
+
+    // Per-token rate limit (require_token already limits per IP).
+    $thash = hash('sha256', fvc_bridge_bearer_token());
+    $tkey  = 'fvc_bridge_pub_rl_' . $thash;
+    $tc    = (int) get_transient($tkey);
+    if ( $tc > 20 ) { fvc_bridge_log('create-listing-ratelimited', ''); return new WP_REST_Response(array('ok' => false, 'error' => 'rate_limited'), 429); }
+    set_transient($tkey, $tc + 1, MINUTE_IN_SECONDS);
+
+    $p   = $req->get_json_params();
+    if ( ! is_array($p) ) $p = $req->get_params();
+    $sid = absint($p['submission_id'] ?? 0);
+    if ( ! $sid ) return new WP_REST_Response(array('ok' => false, 'error' => 'submission_id required'), 400);
+
+    $table = fvc_bridge_table();
+    $sub   = $wpdb->get_row($wpdb->prepare("SELECT * FROM $table WHERE id = %d", $sid), ARRAY_A);
+    if ( ! $sub ) { fvc_bridge_log('create-listing-notfound', 'id=' . $sid); return new WP_REST_Response(array('ok' => false, 'error' => 'submission not found'), 404); }
+    if ( $sub['type'] !== 'add' ) return new WP_REST_Response(array('ok' => false, 'error' => 'only add-type submissions create listings'), 400);
+    if ( $sub['status'] === 'published' ) { fvc_bridge_log('create-listing-dupe', 'id=' . $sid); return new WP_REST_Response(array('ok' => false, 'error' => 'already published', 'post_id' => (int) $sub['matched_post_id']), 409); }
+
+    // Category from the submitted services (falls back to Physiotherapy).
+    $services = strtolower((string) $sub['services']);
+    $cat = 0;
+    foreach ( array('physio' => 7, 'chiro' => 16, 'massage' => 17, 'naturopath' => 18, 'acupunctur' => 19) as $kw => $id ) {
+        if ( strpos($services, $kw) !== false ) { $cat = $id; break; }
+    }
+    if ( ! $cat ) $cat = 7;
+
+    $flag   = function ($v) { $v = strtolower((string) $v); return ($v === 'yes' || $v === '1') ? 1 : 0; };
+    $status = (isset($p['status']) && $p['status'] === 'draft') ? 'draft' : 'publish';
+
+    $post_id = wp_insert_post(array(
+        'post_type' => 'gd_place', 'post_status' => $status,
+        'post_title' => $sub['clinic_name'], 'post_content' => '', 'post_author' => 1,
+    ), true);
+    if ( is_wp_error($post_id) ) { fvc_bridge_log('create-listing-failed', $post_id->get_error_message()); return new WP_REST_Response(array('ok' => false, 'error' => $post_id->get_error_message()), 500); }
+
+    // Detail row — matches the structure learned from an existing listing.
+    $wpdb->replace($wpdb->prefix . 'geodir_gd_place_detail', array(
+        'post_id'                  => $post_id,
+        'post_title'               => $sub['clinic_name'],
+        '_search_title'            => strtolower($sub['clinic_name']),
+        'post_status'              => $status,
+        'post_tags'                => '',
+        'post_category'            => ',' . $cat . ',',
+        'default_category'         => $cat,
+        'featured'                 => 0,
+        'overall_rating'           => 0,
+        'rating_count'             => 0,
+        'street'                   => (string) $sub['address'],
+        'street2'                  => '',
+        'city'                     => 'Vancouver',
+        'region'                   => 'British Columbia',
+        'country'                  => 'Canada',
+        'zip'                      => '',
+        'icbc_approved'            => $flag($sub['icbc']),
+        '_worksafebc_approved'     => $flag($sub['worksafe']),
+        'direct_billing'           => $flag($sub['billing']),
+        'online_booking_available' => $flag($sub['booking']),
+        'website'                  => (string) $sub['website'],
+        'l'                        => (string) $sub['phone'],
+        'email'                    => '',
+        'business_status'          => 'OPERATIONAL',
+        'enrichment_status'        => 'pending',
+    ));
+
+    // Category term relationship + count.
+    $wpdb->query($wpdb->prepare("INSERT IGNORE INTO {$wpdb->prefix}term_relationships (object_id, term_taxonomy_id, term_order) VALUES (%d, %d, 0)", $post_id, $cat));
+    $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}term_taxonomy SET count = count + 1 WHERE term_taxonomy_id = %d", $cat));
+
+    // Mark the submission published so it can never be published twice.
+    $wpdb->update($table, array('status' => 'published', 'matched_post_id' => $post_id), array('id' => $sid));
+
+    fvc_bridge_log('create-listing', "sid=$sid post=$post_id status=$status cat=$cat");
+    return new WP_REST_Response(array(
+        'ok' => true, 'submission_id' => $sid, 'post_id' => $post_id,
+        'status' => $status, 'category' => $cat,
+        'view' => get_permalink($post_id), 'edit' => admin_url('post.php?post=' . $post_id . '&action=edit'),
     ), 200);
 }
 
