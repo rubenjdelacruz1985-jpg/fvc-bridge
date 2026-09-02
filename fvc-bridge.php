@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.11.0
+ * Version: 1.12.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.11.0');
+define('FVC_BRIDGE_VERSION',    '1.12.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -144,6 +144,12 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_publish_post',
+    ));
+    // Token-gated: set a post's featured image from a base64-encoded image.
+    register_rest_route('fvc-bridge/v1', '/set-featured-image', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_set_featured_image',
     ));
 });
 
@@ -949,6 +955,44 @@ function fvc_bridge_rest_publish_post($req) {
         'ok' => true, 'post_id' => $post_id, 'status' => $status, 'updated' => (bool) $existing,
         'view' => get_permalink($post_id), 'edit' => admin_url('post.php?post=' . $post_id . '&action=edit'),
     ), 200);
+}
+
+// REST: set a post's featured image from a base64-encoded image (PNG/JPG).
+function fvc_bridge_rest_set_featured_image($req) {
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+
+    $p = $req->get_json_params();
+    if ( ! is_array($p) ) $p = $req->get_params();
+    $post_id  = absint($p['post_id'] ?? 0);
+    $b64      = $p['image_base64'] ?? '';
+    $filename = sanitize_file_name($p['filename'] ?? 'featured.png');
+    $alt      = sanitize_text_field($p['alt'] ?? '');
+    if ( ! $post_id || ! $b64 ) return new WP_REST_Response(array('ok' => false, 'error' => 'post_id and image_base64 required'), 400);
+    if ( ! get_post($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'post not found'), 404);
+
+    $data = base64_decode($b64, true);
+    if ( $data === false ) return new WP_REST_Response(array('ok' => false, 'error' => 'invalid base64'), 400);
+
+    $upload = wp_upload_bits($filename, null, $data);
+    if ( ! empty($upload['error']) ) return new WP_REST_Response(array('ok' => false, 'error' => $upload['error']), 500);
+
+    $filetype  = wp_check_filetype($upload['file']);
+    $attach_id = wp_insert_attachment(array(
+        'post_mime_type' => $filetype['type'],
+        'post_title'     => $alt ? $alt : $filename,
+        'post_content'   => '',
+        'post_status'    => 'inherit',
+    ), $upload['file'], $post_id);
+    if ( is_wp_error($attach_id) ) return new WP_REST_Response(array('ok' => false, 'error' => $attach_id->get_error_message()), 500);
+
+    wp_update_attachment_metadata($attach_id, wp_generate_attachment_metadata($attach_id, $upload['file']));
+    if ( $alt ) update_post_meta($attach_id, '_wp_attachment_image_alt', $alt);
+    set_post_thumbnail($post_id, $attach_id);
+
+    fvc_bridge_log('set-featured-image', "post=$post_id attach=$attach_id");
+    return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'attachment_id' => $attach_id, 'url' => wp_get_attachment_url($attach_id)), 200);
 }
 
 // -- "You can now manage your listing" email (claim approved) --
