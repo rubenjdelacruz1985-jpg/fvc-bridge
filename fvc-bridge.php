@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.4.1
+ * Version: 1.5.0
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.4.1');
+define('FVC_BRIDGE_VERSION',    '1.5.0');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -122,6 +122,12 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_create_listing',
+    ));
+    // Token-gated: send the "your listing is now live" email for a published listing.
+    register_rest_route('fvc-bridge/v1', '/notify-live', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_notify_live',
     ));
 });
 
@@ -408,8 +414,36 @@ function fvc_bridge_email_shell($preheader, $heading, $inner_html) {
     . '<tr><td style="height:4px;background:#09BDB8;font-size:0;line-height:0;">&nbsp;</td></tr>'
     . '<tr><td style="padding:34px 32px 8px;"><h1 style="margin:0 0 14px;font-size:23px;line-height:1.25;color:#09090B;">' . $heading . '</h1>' . $inner_html
     . '<p style="margin:14px 0 0;font-size:14px;color:#6b6b6e;">&mdash; The Find Vancouver Clinics team</p></td></tr>'
-    . '<tr><td style="padding:22px 32px;background:#fafafa;border-top:1px solid #eee;"><p style="margin:0;font-size:12px;line-height:1.5;color:#9ca3af;">Find Vancouver Clinics &middot; Vancouver, BC<br>You received this because you contacted us at <a href="https://findvancouverclinics.com" style="color:#6b6b6e;">findvancouverclinics.com</a>.</p></td></tr>'
+    . '<tr><td style="padding:22px 32px;background:#fafafa;border-top:1px solid #eee;"><p style="margin:0 0 6px;font-size:13px;color:#3f3f46;">Questions? Just reply to this email — a real person reads it.</p><p style="margin:0;font-size:12px;line-height:1.5;color:#9ca3af;">Find Vancouver Clinics &middot; Vancouver, BC &middot; <a href="https://findvancouverclinics.com" style="color:#6b6b6e;">findvancouverclinics.com</a><br>You received this because your clinic was submitted to or listed on our directory.</p></td></tr>'
     . '</table></td></tr></table>';
+}
+
+// -- "Your listing is now live" email --
+function fvc_bridge_send_live_email($to, $contact, $clinic, $view_url) {
+    if ( ! is_email($to) ) return false;
+    $inner =
+        '<p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#3f3f46;">Great news, ' . esc_html($contact) . ' — <strong>' . esc_html($clinic) . '</strong> is now live on Find Vancouver Clinics and showing to patients searching your area.</p>'
+      . '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:4px 0 22px;"><tr><td style="border-radius:8px;background:#09BDB8;"><a href="' . esc_url($view_url) . '" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#fff;text-decoration:none;">View your listing &rarr;</a></td></tr></table>'
+      . '<p style="margin:0 0 8px;font-size:14px;line-height:1.6;color:#3f3f46;">Want to manage it yourself — update hours, services, photos and more? <strong>Claim your listing</strong> to get edit access:</p>'
+      . '<p style="margin:0;font-size:14px;"><a href="https://findvancouverclinics.com/claim-listing/" style="color:#0a8f8b;">Claim this listing &rarr;</a></p>';
+    $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>', 'Reply-To: Find Vancouver Clinics <claim@findvancouverclinics.com>');
+    return wp_mail($to, 'Your clinic is now live on Find Vancouver Clinics', fvc_bridge_email_shell('Your clinic is now live on Find Vancouver Clinics.', 'You\'re live, ' . esc_html($contact) . '.', $inner), $headers);
+}
+
+// -- "You're already listed — claim it" email (sent when a submission matches an existing listing) --
+function fvc_bridge_send_claim_invite($to, $contact, $clinic, $listing_url) {
+    if ( ! is_email($to) ) return false;
+    $inner =
+        '<p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#3f3f46;">Thanks for reaching out, ' . esc_html($contact) . '. Good news — <strong>' . esc_html($clinic) . '</strong> already appears on Find Vancouver Clinics, so there\'s no need to add it again:</p>'
+      . '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:4px 0 22px;"><tr><td style="border-radius:8px;background:#09BDB8;"><a href="' . esc_url($listing_url) . '" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#fff;text-decoration:none;">See your current listing &rarr;</a></td></tr></table>'
+      . '<p style="margin:0 0 8px;font-size:15px;line-height:1.6;color:#3f3f46;">To take ownership and manage it (hours, services, photos, insurance details), <strong>claim it</strong>:</p>'
+      . '<p style="margin:0 0 20px;font-size:14px;"><a href="https://findvancouverclinics.com/claim-listing/" style="color:#0a8f8b;">Claim this listing &rarr;</a></p>'
+      . '<div style="background:#f7f7f7;border-left:3px solid #09BDB8;border-radius:6px;padding:14px 16px;">'
+      . '<p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#09090B;">How we verify it\'s really you</p>'
+      . '<p style="margin:0;font-size:13px;line-height:1.6;color:#3f3f46;">To protect clinics, we confirm ownership before granting edit access. We\'ll verify using one of: an email address on the clinic\'s own domain, a quick call to the clinic\'s publicly listed phone number, or a business document (e.g., licence or a photo of clinic signage). We\'ll be in touch within 1&ndash;2 business days after you claim.</p>'
+      . '</div>';
+    $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>', 'Reply-To: Find Vancouver Clinics <claim@findvancouverclinics.com>');
+    return wp_mail($to, 'Your clinic is already on Find Vancouver Clinics — claim it', fvc_bridge_email_shell('Your clinic is already listed — here\'s how to claim it.', 'You\'re already listed, ' . esc_html($contact) . '.', $inner), $headers);
 }
 
 function fvc_bridge_send_brevo($email, $contact_name, $attrs) {
@@ -486,7 +520,13 @@ function fvc_bridge_new_listing_handler() {
         . '<tr><td style="padding:10px 0;font-size:14px;color:#3f3f46;"><span style="color:#09BDB8;font-weight:700;">3.</span>&nbsp; We email you the link the moment it&#39;s published.</td></tr></table>'
         . '<table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#09BDB8;"><a href="https://findvancouverclinics.com/places/" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#fff;text-decoration:none;">Browse the directory &rarr;</a></td></tr></table>'
     );
-    wp_mail($d['email'], 'We received your listing request - Find Vancouver Clinics', $confirm, $headers);
+    if ( $match && $match['score'] >= 90 ) {
+        // Confident duplicate — point them to the existing listing + how to claim it,
+        // instead of the "new listing received" confirmation.
+        fvc_bridge_send_claim_invite($d['email'], $d['contact'], $d['clinic_name'], $match['url']);
+    } else {
+        wp_mail($d['email'], 'We received your listing request - Find Vancouver Clinics', $confirm, $headers);
+    }
 
     if ( $d['consent'] ) {
         fvc_bridge_send_brevo($d['email'], $d['contact'], array('CLINIC_NAME' => $d['clinic_name'], 'ROLE' => $d['role'], 'CLAIM_STATUS' => 'new_listing', 'SERVICES' => $d['services'], 'ICBC_APPROVED' => $d['icbc'], 'WORKSAFE_APPROVED' => $d['worksafe'], 'DIRECT_BILLING' => $d['billing'], 'ONLINE_BOOKING' => $d['booking']));
@@ -695,12 +735,38 @@ function fvc_bridge_rest_create_listing($req) {
     // Mark the submission published so it can never be published twice.
     $wpdb->update($table, array('status' => 'published', 'matched_post_id' => $post_id), array('id' => $sid));
 
+    // Optional: email the clinic that they're now live (uses the submission's email).
+    $notified = false;
+    if ( ! empty($p['notify']) && $status === 'publish' && is_email($sub['email']) ) {
+        $notified = fvc_bridge_send_live_email($sub['email'], $sub['contact_name'], $sub['clinic_name'], get_permalink($post_id));
+        fvc_bridge_log('notify-live', "sid=$sid to=" . $sub['email'] . " sent=" . ($notified ? '1' : '0'));
+    }
+
     fvc_bridge_log('create-listing', "sid=$sid post=$post_id status=$status cat=$cat");
     return new WP_REST_Response(array(
         'ok' => true, 'submission_id' => $sid, 'post_id' => $post_id,
-        'status' => $status, 'category' => $cat,
+        'status' => $status, 'category' => $cat, 'notified' => $notified,
         'view' => get_permalink($post_id), 'edit' => admin_url('post.php?post=' . $post_id . '&action=edit'),
     ), 200);
+}
+
+// REST: send the "your listing is now live" email for a published listing, to a
+// given address. Only sends the fixed template, only for a published gd_place.
+function fvc_bridge_rest_notify_live($req) {
+    $p       = $req->get_json_params();
+    if ( ! is_array($p) ) $p = $req->get_params();
+    $post_id = absint($p['post_id'] ?? 0);
+    $email   = sanitize_email($p['email'] ?? '');
+    $contact = sanitize_text_field($p['contact'] ?? 'there');
+    if ( ! $post_id || ! is_email($email) ) return new WP_REST_Response(array('ok' => false, 'error' => 'post_id and a valid email required'), 400);
+
+    $post = get_post($post_id);
+    if ( ! $post || $post->post_type !== 'gd_place' || $post->post_status !== 'publish' ) {
+        return new WP_REST_Response(array('ok' => false, 'error' => 'not a published listing'), 400);
+    }
+    $sent = fvc_bridge_send_live_email($email, $contact, $post->post_title, get_permalink($post_id));
+    fvc_bridge_log('notify-live-manual', "post=$post_id to=$email sent=" . ($sent ? '1' : '0'));
+    return new WP_REST_Response(array('ok' => (bool) $sent, 'post_id' => $post_id, 'to' => $email), 200);
 }
 
 /* ============================================================
