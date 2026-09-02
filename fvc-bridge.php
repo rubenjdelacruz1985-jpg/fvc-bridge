@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.4.0
+ * Version: 1.4.1
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.4.0');
+define('FVC_BRIDGE_VERSION',    '1.4.1');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -126,6 +126,7 @@ add_action('rest_api_init', function () {
 });
 
 function fvc_bridge_rest_health() {
+    nocache_headers(); // don't let the host proxy-cache this (stale version reads)
     $manifest = fvc_bridge_get_manifest(true);
     $latest   = ( $manifest && ! empty($manifest['version']) ) ? $manifest['version'] : null;
     return new WP_REST_Response(array(
@@ -566,6 +567,7 @@ function fvc_bridge_rest_check_dup($req) {
 
 // REST: token-gated list of stored submissions for review tooling.
 function fvc_bridge_rest_submissions($req) {
+    nocache_headers(); // don't let the host proxy-cache the queue (stale reads)
     global $wpdb;
     $status = sanitize_text_field($req->get_param('status') ?: 'new');
     $table  = fvc_bridge_table();
@@ -577,6 +579,7 @@ function fvc_bridge_rest_submissions($req) {
 // REST: token-gated anatomy of an existing published listing, so the create
 // endpoint can be built to match GeoDirectory's exact structure.
 function fvc_bridge_rest_inspect($req) {
+    nocache_headers();
     global $wpdb;
     $pid = absint($req->get_param('post_id'));
     if ( ! $pid ) {
