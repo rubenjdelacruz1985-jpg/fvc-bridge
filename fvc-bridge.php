@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.15.0
+ * Version: 1.16.58
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.15.0');
+define('FVC_BRIDGE_VERSION',    '1.16.58');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -69,6 +69,18 @@ function fvc_bridge_require_token() {
     }
     fvc_bridge_log('auth-failed', 'ip=' . $ip);
     return new WP_Error('unauthorized', 'Invalid or missing token', array('status' => 401));
+}
+
+// Boolean token check (no rate-limit side effects) — for endpoints that accept EITHER a WP login or a token.
+function fvc_bridge_has_valid_token() {
+    if ( ! empty($GLOBALS['fvc_bridge_internal']) && current_user_can('manage_options') ) return true;
+    $token = fvc_bridge_bearer_token();
+    if ( ! $token ) return false;
+    $hash = hash('sha256', $token);
+    foreach ( get_option('fvc_bridge_tokens', array()) as $t ) {
+        if ( ! empty($t['hash']) && hash_equals($t['hash'], $hash) ) return true;
+    }
+    return false;
 }
 
 /* ============================================================
@@ -157,10 +169,293 @@ add_action('rest_api_init', function () {
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_media',
     ));
+    // Token-gated: Google ratings per listing (post_id => {rating, count}) from the detail table.
+    register_rest_route('fvc-bridge/v1', '/ratings', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_ratings',
+    ));
+    // Clinic Site Builder: a logged-in owner (or admin/token tooling) publishes their clinic's site.
+    register_rest_route('fvc-bridge/v1', '/clinic-publish', array(
+        'methods'             => 'POST',
+        'permission_callback' => function () { return is_user_logged_in() || fvc_bridge_has_valid_token(); },
+        'callback'            => 'fvc_bridge_rest_clinic_publish',
+    ));
+    // Who am I + which listings I own (for the builder's owner-gating). Logged-in only.
+    register_rest_route('fvc-bridge/v1', '/clinic-me', array(
+        'methods'             => 'GET',
+        'permission_callback' => function () { return is_user_logged_in(); },
+        'callback'            => 'fvc_bridge_rest_clinic_me',
+    ));
+    // Take a clinic's site offline (set its page to draft) — owner of the listing, admin, or token.
+    register_rest_route('fvc-bridge/v1', '/clinic-unpublish', array(
+        'methods'             => 'POST',
+        'permission_callback' => function () { return is_user_logged_in() || fvc_bridge_has_valid_token(); },
+        'callback'            => 'fvc_bridge_rest_clinic_unpublish',
+    ));
+    // ---- Booking v1 (native) ----
+    register_rest_route('fvc-bridge/v1', '/booking-config', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_config'));
+    register_rest_route('fvc-bridge/v1', '/booking-config-save', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_config_save'));
+    register_rest_route('fvc-bridge/v1', '/booking-slots', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_slots'));
+    register_rest_route('fvc-bridge/v1', '/booking-create', array('methods'=>'POST','permission_callback'=>'fvc_bridge_require_token_or_public','callback'=>'fvc_bridge_rest_booking_create'));
+    register_rest_route('fvc-bridge/v1', '/booking-list', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_list'));
+    register_rest_route('fvc-bridge/v1', '/booking-status', array('methods'=>'POST','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_status'));
+    register_rest_route('fvc-bridge/v1', '/booking-ics', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_ics'));
+    register_rest_route('fvc-bridge/v1', '/booking-feed', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_feed'));
+    register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
+    // Public read: a clinic's listing data, formatted to seed the site builder.
+    register_rest_route('fvc-bridge/v1', '/clinic-data', array(
+        'methods'             => 'GET',
+        'permission_callback' => '__return_true',
+        'callback'            => 'fvc_bridge_rest_clinic_data',
+    ));
+    // Token-gated: upload a base64 image to the media library, return its URL (builds the photo library).
+    register_rest_route('fvc-bridge/v1', '/upload-image', array(
+        'methods'             => 'POST',
+        'permission_callback' => function () { return ( is_user_logged_in() && current_user_can('upload_files') ) || fvc_bridge_has_valid_token(); },
+        'callback'            => 'fvc_bridge_rest_upload_image',
+    ));
 });
+
+function fvc_bridge_rest_upload_image($req) {
+    require_once ABSPATH . 'wp-admin/includes/image.php';
+    require_once ABSPATH . 'wp-admin/includes/file.php';
+    require_once ABSPATH . 'wp-admin/includes/media.php';
+    $p = $req->get_json_params();
+    $b64 = $p['image_base64'] ?? '';
+    $fn = sanitize_file_name($p['filename'] ?? ('img-' . time() . '.jpg'));
+    if ( ! $b64 ) return new WP_REST_Response(array('ok' => false, 'error' => 'no image'), 400);
+    $up = wp_upload_bits($fn, null, base64_decode($b64));
+    if ( ! empty($up['error']) ) return new WP_REST_Response(array('ok' => false, 'error' => $up['error']), 500);
+    $ft = wp_check_filetype($up['file']);
+    $aid = wp_insert_attachment(array('post_mime_type' => $ft['type'], 'post_title' => preg_replace('/\.[^.]+$/', '', $fn), 'post_status' => 'inherit'), $up['file']);
+    wp_update_attachment_metadata($aid, wp_generate_attachment_metadata($aid, $up['file']));
+    if ( ! empty($p['alt']) ) update_post_meta($aid, '_wp_attachment_image_alt', sanitize_text_field($p['alt']));
+    return new WP_REST_Response(array('ok' => true, 'id' => $aid, 'url' => wp_get_attachment_url($aid)), 200);
+}
+
+// Return one clinic's public listing data (name, contact, rating, categories, flags) for the builder.
+function fvc_bridge_rest_clinic_data($req) {
+    global $wpdb;
+    $id = (int) $req->get_param('listing');
+    if ( ! $id ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing id required'), 400);
+    $post = get_post($id);
+    if ( ! $post || $post->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    $d = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}geodir_gd_place_detail WHERE post_id = %d", $id), ARRAY_A);
+    $d = $d ?: array();
+    $yes = function ($v) { return $v === '1' || $v === 1 || $v === 'Yes'; };
+    $cats = wp_get_post_terms($id, 'gd_placecategory', array('fields' => 'names'));
+    return new WP_REST_Response(array(
+        'ok'            => true,
+        'listingId'     => $id,
+        'name'          => html_entity_decode($post->post_title, ENT_QUOTES),
+        'neighbourhood' => $d['neighbourhood'] ?? '',
+        'city'          => $d['city'] ?? 'Vancouver',
+        'address'       => trim($d['street'] ?? ''),
+        'phone'         => $d['l'] ?? '',
+        'hours'         => $d['business_hours'] ?? '',
+        'rating'        => isset($d['google_rating']) ? (float) $d['google_rating'] : 0,
+        'reviews'       => isset($d['google_review_count']) ? (int) $d['google_review_count'] : 0,
+        'categories'    => array_values((array) $cats),
+        'icbc'          => $yes($d['icbc_approved'] ?? ''),
+        'directBilling' => $yes($d['direct_billing'] ?? ''),
+        'onlineBooking' => $yes($d['online_booking_available'] ?? ''),
+        'website'       => $d['website'] ?? '',
+        'listingUrl'    => get_permalink($id),
+        'sitePostId'    => (function () use ($id) { $s = (int) get_post_meta($id, '_fvc_site_page', true); return ($s && get_post($s)) ? $s : 0; })(),
+        'placeId'       => $d['google_place_id'] ?? '',
+        'writeReviewUrl'=> ! empty($d['google_place_id']) ? ('https://search.google.com/local/writereview?placeid=' . rawurlencode($d['google_place_id'])) : '',
+    ), 200);
+}
+
+// Current user + the listings they own (post_author set on claim approval) — powers builder gating.
+function fvc_bridge_rest_clinic_me($req) {
+    nocache_headers(); // per-user data — never shared-cache
+    $uid = get_current_user_id();
+    if ( ! $uid ) return new WP_REST_Response(array('ok' => false, 'error' => 'not logged in'), 401);
+    $posts = get_posts(array('post_type' => 'gd_place', 'author' => $uid, 'numberposts' => 20,
+        'post_status' => array('publish', 'draft', 'pending')));
+    $listings = array();
+    foreach ( $posts as $po ) {
+        $site = (int) get_post_meta($po->ID, '_fvc_site_page', true);
+        $listings[] = array(
+            'listingId' => $po->ID,
+            'name'      => html_entity_decode($po->post_title, ENT_QUOTES),
+            'siteUrl'   => ($site && get_post($site)) ? get_permalink($site) : '',
+        );
+    }
+    $u = wp_get_current_user();
+    return new WP_REST_Response(array('ok' => true, 'userId' => $uid, 'displayName' => $u->display_name,
+        'isAdmin' => current_user_can('manage_options'), 'listings' => $listings), 200);
+}
+
+// Take a clinic's site offline (draft) — same ownership rules as clinic-publish.
+function fvc_bridge_rest_clinic_unpublish($req) {
+    $p = $req->get_json_params();
+    $listing_id = (int) ($p['listing_id'] ?? $p['listingId'] ?? 0);
+    if ( ! $listing_id ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing id required'), 400);
+    $listing = get_post($listing_id);
+    if ( ! $listing || $listing->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing not found'), 404);
+    $is_token = fvc_bridge_has_valid_token();
+    $uid = get_current_user_id();
+    $owns = $is_token || current_user_can('manage_options') || ( $uid && (int) $listing->post_author === $uid );
+    if ( ! $owns ) return new WP_REST_Response(array('ok' => false, 'error' => 'you do not own this listing'), 403);
+    $site_id = (int) get_post_meta($listing_id, '_fvc_site_page', true);
+    if ( ! $site_id || ! get_post($site_id) ) return new WP_REST_Response(array('ok' => true, 'note' => 'no site to unpublish'), 200);
+    wp_update_post(array('ID' => $site_id, 'post_status' => 'draft'));
+    fvc_bridge_log('clinic-unpublish', "listing=$listing_id site=$site_id user=$uid token=" . ($is_token ? '1' : '0'));
+    return new WP_REST_Response(array('ok' => true, 'post_id' => $site_id, 'status' => 'draft'), 200);
+}
+
+// Publish a clinic's white-label site. Two modes:
+//  (a) listing_id  — the owner (post_author of the gd_place) OR admin/token creates/updates a
+//      DEDICATED canvas page for that clinic (linked via _fvc_site_page / _fvc_site_listing).
+//  (b) post_id     — legacy: update a specific page the caller can already edit.
+function fvc_bridge_rest_clinic_publish($req) {
+    $p = $req->get_json_params();
+    $content = (string) ($p['content'] ?? '');
+    if ( strlen($content) < 50 ) return new WP_REST_Response(array('ok' => false, 'error' => 'empty content'), 400);
+
+    $is_token   = fvc_bridge_has_valid_token();
+    $user_id    = get_current_user_id();
+    $listing_id = (int) ($p['listing_id'] ?? $p['listingId'] ?? 0);
+
+    if ( $listing_id ) {
+        $listing = get_post($listing_id);
+        if ( ! $listing || $listing->post_type !== 'gd_place' ) {
+            return new WP_REST_Response(array('ok' => false, 'error' => 'listing not found'), 404);
+        }
+        $owns = $is_token || current_user_can('manage_options')
+             || ( $user_id && (int) $listing->post_author === $user_id );
+        if ( ! $owns ) return new WP_REST_Response(array('ok' => false, 'error' => 'you do not own this listing'), 403);
+
+        $site_id = (int) get_post_meta($listing_id, '_fvc_site_page', true);
+        if ( $site_id && ! get_post($site_id) ) $site_id = 0;
+        $title  = html_entity_decode($listing->post_title, ENT_QUOTES);
+        $author = ( $user_id && ! $is_token ) ? $user_id : (int) $listing->post_author;
+        if ( ! $author ) $author = 1;
+
+        kses_remove_filters();
+        if ( $site_id ) {
+            $r = wp_update_post(array('ID' => $site_id, 'post_content' => wp_slash($content), 'post_title' => $title), true);
+        } else {
+            $slug = ! empty($p['slug']) ? sanitize_title($p['slug']) : sanitize_title($title);
+            $r = wp_insert_post(array(
+                'post_type'    => 'page', 'post_status' => 'publish', 'post_title' => $title,
+                'post_name'    => $slug, 'post_content' => wp_slash($content), 'post_author' => $author,
+            ), true);
+        }
+        kses_init_filters();
+        if ( is_wp_error($r) ) return new WP_REST_Response(array('ok' => false, 'error' => $r->get_error_message()), 500);
+        if ( ! $site_id ) $site_id = (int) $r;
+
+        update_post_meta($site_id, '_fvc_raw_html', 1);
+        update_post_meta($site_id, '_wp_page_template', 'elementor_canvas'); // white-label standalone
+        update_post_meta($site_id, '_fvc_site_listing', $listing_id);
+        if ( ! empty($p['schema_jsonld']) ) update_post_meta($site_id, '_fvc_schema_b64', base64_encode((string) $p['schema_jsonld']));
+        update_post_meta($listing_id, '_fvc_site_page', $site_id);
+
+        if ( function_exists('fvc_bridge_indexnow_ping') ) fvc_bridge_indexnow_ping(get_permalink($site_id));
+        fvc_bridge_log('clinic-publish', "listing=$listing_id site=$site_id user=$user_id token=" . ($is_token ? '1' : '0'));
+        return new WP_REST_Response(array('ok' => true, 'post_id' => $site_id, 'view' => get_permalink($site_id)), 200);
+    }
+
+    // Legacy post_id mode.
+    $post_id = (int) ($p['post_id'] ?? 0);
+    if ( ! $post_id || ! ( $is_token || current_user_can('edit_post', $post_id) ) ) {
+        return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed to edit this page'), 403);
+    }
+    update_post_meta($post_id, '_fvc_raw_html', 1);
+    kses_remove_filters();
+    $r = wp_update_post(array('ID' => $post_id, 'post_content' => wp_slash($content)), true);
+    kses_init_filters();
+    if ( is_wp_error($r) ) return new WP_REST_Response(array('ok' => false, 'error' => $r->get_error_message()), 500);
+    if ( function_exists('fvc_bridge_indexnow_ping') ) fvc_bridge_indexnow_ping(get_permalink($post_id));
+    return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'view' => get_permalink($post_id)), 200);
+}
+
+// REST: Google ratings map from the GeoDirectory detail table (google_rating/google_review_count).
+function fvc_bridge_rest_ratings($req) {
+    global $wpdb;
+    $rows = $wpdb->get_results(
+        "SELECT post_id, google_rating, google_review_count
+         FROM {$wpdb->prefix}geodir_gd_place_detail
+         WHERE google_rating IS NOT NULL AND google_rating > 0", ARRAY_A);
+    $out = array();
+    foreach ((array) $rows as $r) {
+        $out[(int) $r['post_id']] = array(
+            'rating' => round((float) $r['google_rating'], 1),
+            'count'  => (int) $r['google_review_count'],
+        );
+    }
+    return new WP_REST_Response(array('ok' => true, 'count' => count($out), 'ratings' => $out), 200);
+}
+
+// Emit per-post custom JSON-LD (stored by publish-post) into <head>.
+add_action('wp_head', 'fvc_bridge_output_schema', 20);
+function fvc_bridge_output_schema() {
+    if ( ! is_singular() ) return;
+    $b64 = get_post_meta(get_queried_object_id(), '_fvc_schema_b64', true);
+    if ( ! $b64 ) return;
+    $json = base64_decode($b64);
+    if ( $json && json_decode($json) !== null ) {
+        echo "\n<script type=\"application/ld+json\">" . $json . "</script>\n";
+    }
+}
+
+// For raw_html posts, skip wpautop/wptexturize so our authored markup renders exactly as written.
+add_filter('the_content', 'fvc_bridge_raw_content', 9);
+function fvc_bridge_raw_content($content) {
+    if ( is_singular() && in_the_loop() && is_main_query() && get_post_meta(get_the_ID(), '_fvc_raw_html', true) ) {
+        remove_filter('the_content', 'wpautop');
+        remove_filter('the_content', 'wptexturize');
+    }
+    return $content;
+}
+
+// Dark-theme the AI Clinic Finder form + results (colour-only override; no HTML/JS touched).
+add_action('wp_head', 'fvc_bridge_finder_css', 30);
+function fvc_bridge_finder_css() {
+    if ( ! is_page('vancouver-clinic-finder') ) return;
+    echo <<<'CSS'
+<style id="fvc-finder-dark">
+body .fvc-cf-widget-section.fvc-cf-widget-section{background:radial-gradient(1000px 480px at 12% -10%,rgba(9,189,184,.13),transparent 58%),#09090B !important;}
+.fvc-cf-widget-section .fvc-cf-form-panel{background:transparent !important;border:0 !important;box-shadow:none !important;}
+.fvc-cf-widget-section .fvc-cf-form-title{color:#fff !important;}
+.fvc-cf-widget-section .fvc-cf-form-sub{color:rgba(255,255,255,.55) !important;}
+.fvc-cf-widget-section .fvc-cf-dd-label,.fvc-cf-widget-section .fvc-cf-freetext-label,.fvc-cf-widget-section .fvc-cf-pref-label{color:#fff !important;}
+.fvc-cf-widget-section .fvc-cf-freetext-opt{color:rgba(255,255,255,.4) !important;}
+.fvc-cf-widget-section .fvc-cf-dd-trigger{background:transparent !important;border:0 !important;}
+.fvc-cf-widget-section .fvc-cf-dd-value{color:rgba(255,255,255,.9) !important;}
+.fvc-cf-widget-section .fvc-cf-dd-arrow{color:rgba(255,255,255,.5) !important;}
+.fvc-cf-widget-section .fvc-cf-dd-options{background:#15171a !important;border:1px solid rgba(255,255,255,.12) !important;}
+.fvc-cf-widget-section .fvc-cf-dd-option{color:rgba(255,255,255,.85) !important;}
+.fvc-cf-widget-section .fvc-cf-freetext-input{background:transparent !important;border:0 !important;color:#fff !important;}
+.fvc-cf-widget-section .fvc-cf-freetext-input::placeholder{color:rgba(255,255,255,.38) !important;}
+.fvc-cf-widget-section .fvc-cf-care-row,.fvc-cf-widget-section .fvc-cf-freetext-row,.fvc-cf-widget-section .fvc-cf-pref-row{border-color:rgba(255,255,255,.1) !important;}
+.fvc-cf-widget-section .fvc-cf-chip{background:transparent !important;border:1px solid rgba(255,255,255,.2) !important;color:rgba(255,255,255,.85) !important;}
+.fvc-cf-widget-section .fvc-cf-submit{background:#09BDB8 !important;color:#fff !important;border:0 !important;}
+.fvc-cf-widget-section .fvc-cf-submit.fvc-cf-disabled{background:rgba(255,255,255,.1) !important;color:rgba(255,255,255,.38) !important;opacity:1 !important;}
+.fvc-cf-widget-section .fvc-cf-results-empty-label,.fvc-cf-widget-section .fvc-cf-results-intro,.fvc-cf-widget-section .fvc-cf-match-count,.fvc-cf-widget-section .fvc-cf-summary-label{color:rgba(255,255,255,.6) !important;}
+.fvc-cf-widget-section .fvc-iw-clinic-card{background:#141619 !important;border:1px solid rgba(255,255,255,.08) !important;border-radius:12px !important;padding:18px 20px !important;margin-bottom:14px !important;}
+.fvc-cf-widget-section .fvc-iw-clinic-name{color:#fff !important;}
+.fvc-cf-widget-section .fvc-iw-clinic-name:hover{color:#2fd4cf !important;}
+.fvc-cf-widget-section .fvc-iw-clinic-btn{color:#2fd4cf !important;}
+.fvc-cf-widget-section .fvc-iw-clinic-blurb{color:rgba(255,255,255,.62) !important;}
+.fvc-cf-widget-section .fvc-iw-badge{color:rgba(255,255,255,.7) !important;border:1px solid rgba(255,255,255,.18) !important;margin:0 6px 4px 0 !important;}
+.fvc-cf-widget-section .fvc-iw-rating{color:#f5b60a !important;}
+.fvc-cf-widget-section .fvc-iw-rating-count{color:rgba(255,255,255,.5) !important;}
+</style>
+CSS;
+}
 
 /* ---- IndexNow: push new/updated URLs to search engines (Bing, Yandex, etc.) ---- */
 add_action('init', 'fvc_bridge_indexnow_keyfile');
+
+// Keep the Rank Math sitemap fresh — bridge-published posts were missing from the
+// cached sitemap. Disabling the cache makes it regenerate on every request (a 12-post
+// site regenerates instantly), so new posts always appear for Google.
+add_filter('rank_math/sitemap/enable_caching', '__return_false');
 function fvc_bridge_indexnow_keyfile() {
     $key = get_option('fvc_bridge_indexnow_key');
     if ( ! $key ) { $key = bin2hex(random_bytes(16)); update_option('fvc_bridge_indexnow_key', $key, false); }
@@ -506,6 +801,279 @@ function fvc_bridge_consent_injection() {
     } catch(e){}
     return of.apply(this, arguments);
   };
+})();</script>
+HTML;
+}
+
+// True on standalone clinic-builder pages (blank canvas) — where directory chrome must NOT appear.
+function fvc_bridge_is_standalone() {
+    return is_singular() && get_post_meta(get_queried_object_id(), '_wp_page_template', true) === 'elementor_canvas';
+}
+
+// Light copy / right-click deterrent on white-label clinic sites (NOT directory or the
+// clinic-tools marketing page). Deters casual copying/image-saving; not real DRM (view-source
+// and devtools still work), but it stops right-click "save image" and drag-off for most visitors.
+add_action('wp_footer', 'fvc_bridge_site_protect', 97);
+function fvc_bridge_site_protect() {
+    if ( ! fvc_bridge_is_standalone() ) return;
+    $slug = get_post_field('post_name', get_queried_object_id());
+    if ( in_array($slug, array('clinic-tools'), true) ) return; // marketing page stays selectable
+    echo <<<'HTML'
+<style id="fvc-protect">
+.cs,.cs *{-webkit-user-select:none;-moz-user-select:none;-ms-user-select:none;user-select:none;}
+.cs input,.cs textarea{-webkit-user-select:text;user-select:text;}
+.cs img{-webkit-user-drag:none;-moz-user-drag:none;user-drag:none;}
+</style>
+<script>(function(){
+  var stop=function(e){e.preventDefault();return false;};
+  ['contextmenu','dragstart','selectstart','copy','cut'].forEach(function(ev){document.addEventListener(ev,stop);});
+  document.addEventListener('keydown',function(e){
+    var k=(e.key||'').toLowerCase();
+    if((e.ctrlKey||e.metaKey)&&['c','x','s','u','a'].indexOf(k)!==-1){return stop(e);}
+  });
+})();</script>
+HTML;
+}
+
+// White-label clinic sites: show ONLY the clinic's name in the browser tab,
+// not "... | Find Vancouver Clinics" — so the standalone site feels like the clinic's own.
+add_filter('document_title_parts', 'fvc_bridge_standalone_title', 99);
+function fvc_bridge_standalone_title($parts) {
+    if ( fvc_bridge_is_standalone() ) {
+        $t = ( isset($parts['title']) && $parts['title'] !== '' ) ? $parts['title'] : get_the_title();
+        return array('title' => $t);
+    }
+    return $parts;
+}
+// Rank Math builds the <title> through its own filter — drop the site suffix there too.
+add_filter('rank_math/frontend/title', 'fvc_bridge_standalone_rm_title', 99);
+function fvc_bridge_standalone_rm_title($title) {
+    if ( fvc_bridge_is_standalone() ) {
+        $t = get_the_title();
+        if ( $t !== '' ) return $t;
+    }
+    return $title;
+}
+
+// Modernize the directory header (sticky glassy bar, gradient pill CTA, pill nav hovers) via a
+// scoped CSS overlay — no markup/JS changes, so the dropdown + mobile menu keep working.
+// Directory pages only (skipped on white-label clinic sites, which have their own chrome).
+add_action('wp_head', 'fvc_bridge_header_css', 31);
+function fvc_bridge_header_css() {
+    if ( fvc_bridge_is_standalone() ) return;
+    echo <<<'HTML'
+<style id="fvc-header-modern">
+.elementor-location-header{position:sticky!important;top:0!important;z-index:1000!important;}
+#fvcNavWrap{background:rgba(9,9,11,.8)!important;-webkit-backdrop-filter:saturate(150%) blur(16px);backdrop-filter:saturate(150%) blur(16px);border-bottom:1px solid rgba(255,255,255,.1)!important;transition:transform .32s ease!important;}
+#fvcNavWrap.fvc-hdr-hidden{transform:translateY(-100%)!important;}
+#fvcNavWrap .fvc-logo{letter-spacing:-.4px!important;color:#fff!important;}
+#fvcNavWrap .fvc-logo-word{color:#fff!important;}
+#fvcNavWrap .fvc-logo-accent{color:#12c7c1!important;}
+#fvcNavWrap .fvc-nav-link,#fvcNavWrap .fvc-drop-trigger{border-radius:10px!important;font-weight:500!important;color:rgba(255,255,255,.74)!important;transition:background .15s,color .15s!important;}
+#fvcNavWrap .fvc-nav-link:hover,#fvcNavWrap .fvc-drop-trigger:hover{background:rgba(255,255,255,.08)!important;color:#fff!important;}
+#fvcNavWrap .fvc-cta{background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;border:0!important;border-radius:4px!important;box-shadow:0 6px 18px rgba(9,189,184,.3)!important;transition:transform .15s ease,box-shadow .15s ease!important;}
+#fvcNavWrap .fvc-cta:hover{transform:translateY(-1px)!important;box-shadow:0 10px 26px rgba(9,189,184,.4)!important;}
+/* dark smart mega menu (desktop) */
+#fvcNavWrap .fvc-drop-menu{width:680px!important;max-width:calc(100vw - 32px)!important;padding:0!important;border-radius:16px!important;border:1px solid rgba(255,255,255,.1)!important;box-shadow:0 28px 64px rgba(0,0,0,.6)!important;background:rgba(16,16,20,.98)!important;-webkit-backdrop-filter:blur(20px)!important;backdrop-filter:blur(20px)!important;overflow:hidden!important;}
+#fvcNavWrap .fvc-dropdown.open .fvc-drop-menu{display:grid!important;grid-template-columns:1.55fr 1fr!important;gap:0!important;}
+.fvc-mega-main{padding:18px 16px 16px!important;min-width:0!important;}
+.fvc-mega-rail{padding:18px 16px 16px!important;background:rgba(255,255,255,.03)!important;border-left:1px solid rgba(255,255,255,.08)!important;display:flex!important;flex-direction:column!important;}
+#fvcNavWrap .fvc-mega-label{display:block!important;font-size:11px!important;font-weight:700!important;letter-spacing:.9px!important;text-transform:uppercase!important;color:rgba(255,255,255,.36)!important;margin:0 0 10px 4px!important;}
+.fvc-mega-grid{display:grid!important;grid-template-columns:1fr 1fr!important;gap:3px!important;}
+#fvcNavWrap .fvc-mega-grid a{display:flex!important;flex-direction:column!important;align-items:flex-start!important;gap:2px!important;padding:10px 12px!important;border-radius:10px!important;color:#fff!important;border:1px solid transparent!important;transition:background .14s,border-color .14s!important;}
+#fvcNavWrap .fvc-mega-grid a:hover{background:rgba(255,255,255,.06)!important;border-color:rgba(255,255,255,.09)!important;}
+#fvcNavWrap .fvc-dm-n{font-size:14px!important;font-weight:600!important;color:#fff!important;}
+#fvcNavWrap .fvc-dm-d{font-size:12px!important;color:rgba(255,255,255,.5)!important;line-height:1.35!important;font-weight:400!important;}
+#fvcNavWrap a.fvc-mega-all{display:inline-flex!important;align-items:center!important;gap:6px!important;margin:12px 0 0 4px!important;font-size:13px!important;font-weight:600!important;color:#12c7c1!important;transition:gap .14s,color .14s!important;}
+#fvcNavWrap a.fvc-mega-all:hover{gap:10px!important;color:#4fe8e3!important;}
+#fvcNavWrap a.fvc-mega-ql{display:flex!important;align-items:center!important;gap:10px!important;padding:9px 10px!important;border-radius:9px!important;color:rgba(255,255,255,.82)!important;font-size:13.5px!important;font-weight:500!important;transition:background .14s,color .14s!important;}
+#fvcNavWrap a.fvc-mega-ql:hover{background:rgba(255,255,255,.06)!important;color:#fff!important;}
+.fvc-ql-dot{width:5px!important;height:5px!important;border-radius:50%!important;background:rgba(255,255,255,.28)!important;flex:none!important;transition:background .14s!important;}
+#fvcNavWrap a.fvc-mega-ql:hover .fvc-ql-dot{background:#12c7c1!important;}
+#fvcNavWrap a.fvc-mega-feat{display:block!important;margin-top:auto!important;padding:14px!important;border-radius:12px!important;background:linear-gradient(135deg,rgba(18,199,193,.16),rgba(10,155,150,.07))!important;border:1px solid rgba(18,199,193,.28)!important;transition:transform .14s,box-shadow .14s!important;}
+#fvcNavWrap a.fvc-mega-feat:hover{transform:translateY(-1px)!important;box-shadow:0 8px 22px rgba(9,189,184,.18)!important;}
+.fvc-feat-t{display:block!important;font-size:13.5px!important;font-weight:700!important;color:#fff!important;margin-bottom:4px!important;}
+.fvc-feat-d{display:block!important;font-size:12px!important;color:rgba(255,255,255,.6)!important;line-height:1.45!important;margin-bottom:8px!important;}
+.fvc-feat-c{display:inline-block!important;font-size:12.5px!important;font-weight:600!important;color:#12c7c1!important;}
+.fvc-feat-badge,.fvc-mm-chip{display:inline-block!important;font-size:10px!important;font-weight:700!important;letter-spacing:.5px!important;background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;padding:2px 6px!important;border-radius:4px!important;margin-left:6px!important;vertical-align:middle!important;}
+/* dark smart mobile menu */
+#fvcMobileMenu{border-radius:0 0 20px 20px!important;box-shadow:0 26px 54px rgba(0,0,0,.5)!important;padding:6px 20px 16px!important;background:rgba(9,9,11,.98)!important;-webkit-backdrop-filter:blur(18px)!important;backdrop-filter:blur(18px)!important;}
+#fvcMobileMenu.open{display:flex!important;flex-direction:column!important;bottom:0!important;z-index:100000!important;overflow-y:auto!important;padding-bottom:16px!important;}
+#fvcMobileMenu .fvc-mobile-section-label{font-size:10.5px!important;font-weight:700!important;letter-spacing:.8px!important;text-transform:uppercase!important;color:rgba(255,255,255,.38)!important;margin:13px 0 3px!important;display:block!important;}
+#fvcMobileMenu>a{display:block!important;padding:9px 2px!important;font-size:15px!important;font-weight:500!important;color:rgba(255,255,255,.84)!important;border-bottom:1px solid rgba(255,255,255,.07)!important;transition:color .12s!important;}
+#fvcMobileMenu>a:hover,#fvcMobileMenu>a:active{color:#4fe8e3!important;}
+#fvcMobileMenu .fvc-mm-grid{display:grid!important;grid-template-columns:1fr 1fr!important;gap:6px!important;margin:3px 0 2px!important;}
+#fvcMobileMenu .fvc-mm-grid a{display:flex!important;flex-direction:column!important;gap:1px!important;padding:9px 11px!important;border:1px solid rgba(255,255,255,.1)!important;border-radius:8px!important;background:rgba(255,255,255,.03)!important;}
+#fvcMobileMenu .fvc-mm-grid a:active{background:rgba(255,255,255,.07)!important;}
+#fvcMobileMenu .fvc-dm-n{font-size:14px!important;font-weight:600!important;color:#fff!important;}
+#fvcMobileMenu .fvc-dm-d{font-size:11px!important;font-weight:400!important;color:rgba(255,255,255,.45)!important;line-height:1.3!important;}
+#fvcMobileMenu>a.fvc-mm-ai{font-weight:600!important;color:#fff!important;}
+#fvcMobileMenu .fvc-mobile-divider{display:none!important;}
+#fvcMobileMenu>a[data-fvc-area="/clinic-tools/"]{color:#4fe8e3!important;font-weight:700!important;}
+#fvcMobileMenu>a.fvc-mm-cta{order:99!important;margin-top:auto!important;text-align:center!important;background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;border:0!important;border-bottom:0!important;border-radius:4px!important;padding:13px!important;font-weight:600!important;box-shadow:0 8px 20px rgba(9,189,184,.3)!important;}
+/* hamburger -> X when the mobile menu is open */
+#fvcHamburger .fvc-hamburger-bar{transition:transform .25s ease,opacity .2s ease!important;}
+body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(1){transform:translateY(7px) rotate(45deg)!important;}
+body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(2){opacity:0!important;}
+body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(3){transform:translateY(-7px) rotate(-45deg)!important;}
+/* AI Finder nav link (header) */
+#fvcNavWrap a.fvc-nav-ai{display:inline-flex!important;align-items:center!important;gap:6px!important;color:rgba(255,255,255,.9)!important;}
+#fvcNavWrap a.fvc-nav-ai:hover{color:#fff!important;}
+#fvcNavWrap .fvc-nav-chip{font-size:9px!important;font-weight:700!important;letter-spacing:.5px!important;background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;padding:2px 5px!important;border-radius:4px!important;}
+/* AI Finder card pinned to the top of the mobile menu */
+#fvcMobileMenu>a.fvc-mm-ai-top{display:block!important;margin:6px 0 2px!important;padding:13px 14px!important;border:1px solid rgba(18,199,193,.3)!important;border-bottom:1px solid rgba(18,199,193,.3)!important;border-radius:10px!important;background:linear-gradient(135deg,rgba(18,199,193,.16),rgba(10,155,150,.07))!important;}
+#fvcMobileMenu .fvc-mm-ai-t{display:block!important;font-size:15px!important;font-weight:700!important;color:#fff!important;}
+#fvcMobileMenu .fvc-mm-ai-d{display:block!important;font-size:12px!important;font-weight:400!important;color:rgba(255,255,255,.6)!important;margin-top:2px!important;}
+/* locked type scale: section headings identical across the home page */
+.fvc-cats-section h2.fvc-cats-h2,.fvc-cta-section h2.fvc-cta-h2{font-size:clamp(28px,4.5vw,42px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
+/* heading WEIGHT consistency: site headings are 500 (single-listing 400, claim-CTA 700, blog 400) */
+body .fvc-cta-wrap h2{font-weight:500!important;letter-spacing:-.03em!important;}
+body.single-post h1,body.single-post h2{font-weight:500!important;}
+/* unify inner-page hero title SIZE to one scale (home hero stays large; blog keeps its own size) */
+body:not(.home) .fvc-hero-h1,.fvc-cf-h1,body .fvc-sl-title{font-size:clamp(28px,4vw,48px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
+/* remove the hero secondary "List your clinic free" button */
+body .fvc-hero-btn-secondary{display:none!important;}
+/* lock inner-page action buttons to the site's 4px rounded-rect (archive/search/single) */
+body .fvc-card-btn,body .fvc-sl-btn,body .fvc-filter-apply,body .fvc-filter-clear{border-radius:4px!important;}
+body .fvc-ft-mail-btn{border-radius:0 4px 4px 0!important;}
+/* dark bottom search bar — full-width docked (not floating) at all widths */
+body #fvc-sb-wrap,html #fvc-sb-wrap{left:0!important;right:0!important;bottom:0!important;width:100%!important;max-width:100%!important;margin:0!important;transform:none!important;border-radius:0!important;padding:11px 24px calc(11px + env(safe-area-inset-bottom,0px))!important;background:#09090b!important;border-top:1px solid rgba(255,255,255,.1)!important;box-shadow:0 -8px 30px rgba(0,0,0,.45)!important;}
+#fvc-sb-inner{background:transparent!important;-webkit-backdrop-filter:none!important;backdrop-filter:none!important;border:0!important;border-radius:0!important;box-shadow:none!important;width:100%!important;max-width:860px!important;margin:0 auto!important;}
+#fvc-sb-wrap .fvc-sb-btn-toggle{border-radius:4px!important;font-weight:600!important;background:rgba(255,255,255,.07)!important;color:#fff!important;border:1px solid rgba(255,255,255,.14)!important;}
+#fvc-sb-wrap #fvc-sb-input{background:rgba(255,255,255,.05)!important;color:#fff!important;border:1px solid rgba(255,255,255,.14)!important;border-radius:4px!important;padding-left:14px!important;padding-right:14px!important;}
+#fvc-sb-wrap #fvc-sb-input::placeholder{color:rgba(255,255,255,.5)!important;}
+#fvc-sb-wrap #fvc-sb-submit,#fvc-sb-inner #fvc-sb-submit{background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;background-color:#0a9b96!important;color:#fff!important;border:0!important;border-radius:4px!important;box-shadow:0 6px 16px rgba(9,189,184,.3)!important;}
+@media(max-width:768px){body #fvc-sb-wrap,html #fvc-sb-wrap{padding-left:12px!important;padding-right:12px!important;box-shadow:0 -10px 30px rgba(0,0,0,.5)!important;}}
+body:has(#fvcMobileMenu.open) #fvc-sb-wrap{display:none!important;}
+</style>
+<script>(function(){
+  var DESC={'physiotherapy':'Injury, pain & recovery','chiropractic':'Alignment & manual therapy','massage therapy':'Therapeutic & relaxation','naturopath':'Natural, whole-body care','acupuncture':'Traditional pain & wellness'};
+  var QUICK=[{h:'/find-a-clinic-by-area/',l:'Find by area'},{h:'/icbc-approved-clinics-vancouver/',l:'ICBC-approved'},{h:'/worksafebc-approved-clinics-vancouver/',l:'WorkSafeBC-approved'},{h:'/places/',l:'All clinics'}];
+  function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function services(){
+    var out=[],seen={};
+    document.querySelectorAll('#fvcDropMenu a').forEach(function(a){
+      if(/fvc-mega/.test(a.className||''))return;
+      var nEl=a.querySelector('.fvc-dm-n');var name=(nEl?nEl.textContent:(a.textContent||'')).trim();
+      var href=a.getAttribute('href');
+      if(name&&href&&!seen[href]){seen[href]=1;out.push({name:name,href:href});}
+    });
+    return out;
+  }
+  function buildDesktop(svc){
+    var menu=document.getElementById('fvcDropMenu');
+    if(!menu||menu.getAttribute('data-mega'))return;
+    var g='';svc.forEach(function(s){g+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(DESC[s.name.toLowerCase()]||'')+'</span></a>';});
+    var ql='';QUICK.forEach(function(q){ql+='<a class="fvc-mega-ql" href="'+q.h+'"><span class="fvc-ql-dot"></span><span>'+q.l+'</span></a>';});
+    menu.innerHTML='<div class="fvc-mega-main"><span class="fvc-mega-label">Browse by specialty</span><div class="fvc-mega-grid">'+g+'</div><a class="fvc-mega-all" href="/places/">View all clinics <span>&rarr;</span></a></div>'+
+      '<div class="fvc-mega-rail"><span class="fvc-mega-label">Quick links</span>'+ql+
+      '<a class="fvc-mega-feat" href="/vancouver-clinic-finder/"><span class="fvc-feat-t">AI Clinic Finder <span class="fvc-feat-badge">AI</span></span><span class="fvc-feat-d">Describe your issue &mdash; get matched to the right clinic in seconds.</span><span class="fvc-feat-c">Try it free &rarr;</span></a></div>';
+    menu.setAttribute('data-mega','1');
+  }
+  function buildMobile(svc){
+    var mm=document.getElementById('fvcMobileMenu');
+    if(!mm||mm.getAttribute('data-mega'))return;
+    var h='<a class="fvc-mm-ai-top" href="/vancouver-clinic-finder/"><span class="fvc-mm-ai-t">AI Clinic Finder <span class="fvc-mm-chip">AI</span></span><span class="fvc-mm-ai-d">Describe your issue &mdash; get matched in seconds</span></a>';
+    h+='<span class="fvc-mobile-section-label">Browse by specialty</span><div class="fvc-mm-grid">';
+    svc.forEach(function(s){h+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(DESC[s.name.toLowerCase()]||'')+'</span></a>';});
+    h+='</div><span class="fvc-mobile-section-label">Quick links</span>';
+    h+='<a class="fvc-mm-ql" data-fvc-area="/find-a-clinic-by-area/" href="/find-a-clinic-by-area/">Find by area</a>';
+    h+='<a class="fvc-mm-ql" href="/icbc-approved-clinics-vancouver/">ICBC-approved</a>';
+    h+='<a class="fvc-mm-ql" href="/worksafebc-approved-clinics-vancouver/">WorkSafeBC-approved</a>';
+    h+='<a class="fvc-mm-ql" href="/places/">All clinics</a>';
+    h+='<span class="fvc-mobile-section-label">For clinics</span>';
+    h+='<a data-fvc-area="/clinic-tools/" href="/clinic-tools/">For clinics &mdash; tools &amp; free site</a>';
+    mm.innerHTML=h;
+    mm.setAttribute('data-mega','1');
+  }
+  function addNavAI(){
+    var nav=document.querySelector('nav.fvc-nav');
+    if(!nav||nav.querySelector('.fvc-nav-ai'))return;
+    var a=document.createElement('a');a.href='/vancouver-clinic-finder/';a.className='fvc-nav-link fvc-nav-ai';a.innerHTML='AI Finder <span class="fvc-nav-chip">AI</span>';
+    var drop=document.getElementById('fvcDrop');
+    if(drop&&drop.parentNode===nav&&drop.nextSibling)nav.insertBefore(a,drop.nextSibling);else nav.insertBefore(a,nav.firstChild);
+  }
+  function hideOnScroll(){
+    var hdr=document.getElementById('fvcNavWrap');
+    if(!hdr)return;
+    hdr.style.setProperty('transition','transform .32s ease','important');
+    var last=window.pageYOffset||0,ticking=false,hidden=false;
+    function show(){if(hidden){hdr.style.setProperty('transform','translateY(0)','important');hidden=false;}}
+    function hide(){if(!hidden){hdr.style.setProperty('transform','translateY(-100%)','important');hidden=true;}}
+    function upd(){
+      var y=window.pageYOffset||0;
+      if(document.querySelector('#fvcMobileMenu.open')||y<120)show();
+      else if(y>last+4)hide();
+      else if(y<last-4)show();
+      last=y;ticking=false;
+    }
+    window.addEventListener('scroll',function(){if(!ticking){requestAnimationFrame(upd);ticking=true;}},{passive:true});
+  }
+  function dedupeHoods(){
+    // the "Browse by neighbourhood" section is duplicated in the page content;
+    // keep the first, hide any extra copies.
+    var secs=document.querySelectorAll('.fvc-hood-section');
+    for(var i=1;i<secs.length;i++)secs[i].style.setProperty('display','none','important');
+  }
+  function blogHeadings(){
+    // blog engine bakes inline font-weight:400!important on headings; the site standard is 500.
+    if(!document.body.classList.contains('single-post'))return;
+    Array.prototype.forEach.call(document.querySelectorAll('h1,h2,h3'),function(h){
+      if(h.closest('header,footer,nav,#fvcNavWrap,#fvcMobileMenu,#fvc-sb-wrap'))return;
+      h.style.setProperty('font-weight','500','important');
+    });
+  }
+  function enhance(){
+    var svc=services();
+    if(svc.length){buildDesktop(svc);buildMobile(svc);}
+    addNavAI();
+    hideOnScroll();
+    blogHeadings();
+    dedupeHoods();setTimeout(dedupeHoods,1000);setTimeout(dedupeHoods,2500);
+    var dt=document.getElementById('fvcDropTrigger');
+    if(dt){for(var i=0;i<dt.childNodes.length;i++){var n=dt.childNodes[i];if(n.nodeType===3&&/clinics/i.test(n.textContent)){n.textContent=n.textContent.replace(/clinics/i,'Services');break;}}}
+  }
+  if(document.readyState!=='loading')enhance();else document.addEventListener('DOMContentLoaded',enhance);
+})();</script>
+HTML;
+}
+
+// Site credit in the footer (owner-requested): design & build by Thumpy Marketing.
+add_action('wp_footer', 'fvc_bridge_footer_credit', 95);
+function fvc_bridge_footer_credit() {
+    if ( fvc_bridge_is_standalone() ) return; // clinic sites are white-label — no directory credit
+    echo <<<'HTML'
+<script>(function(){
+  function addCredit(){
+    if (document.getElementById('fvc-thumpy-credit')) return;
+    var f = document.querySelector('.elementor-location-footer') || document.querySelector('[data-elementor-type="footer"]') || document.querySelector('footer');
+    var d = document.createElement('div');
+    d.id = 'fvc-thumpy-credit';
+    d.style.cssText = 'text-align:center;padding:14px 20px 18px;font:400 13px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;color:#8a8a8f;';
+    d.innerHTML = 'Website design &amp; build by <a href="https://thumpymarketing.com" target="_blank" rel="noopener" style="color:#09BDB8;text-decoration:none;">Thumpy Marketing</a>';
+    if (f) f.appendChild(d); else document.body.appendChild(d);
+  }
+  if (document.readyState !== 'loading') addCredit(); else document.addEventListener('DOMContentLoaded', addCredit);
+})();</script>
+HTML;
+}
+
+// Add a "Find by Area" link into the header nav, the mobile menu, and the footer
+// (all are custom fvc- structures, not WP menus, so we inject to match each one's styling).
+add_action('wp_footer', 'fvc_bridge_nav_area_link', 96);
+function fvc_bridge_nav_area_link() {
+    if ( fvc_bridge_is_standalone() ) return; // no directory nav on white-label clinic sites
+    echo <<<'HTML'
+<script>(function(){
+  var LINKS=[{h:'/find-a-clinic-by-area/',l:'Find by Area'},{h:'/clinic-tools/',l:'For Clinics'}];
+  function mk(k,cls){var a=document.createElement('a');a.href=k.h;a.textContent=k.l;if(cls)a.className=cls;a.setAttribute('data-fvc-area',k.h);return a;}
+  function add(){
+    document.querySelectorAll('nav.fvc-nav').forEach(function(n){LINKS.forEach(function(k){if(!n.querySelector('[data-fvc-area="'+k.h+'"]'))n.appendChild(mk(k,'fvc-nav-link'));});});
+    document.querySelectorAll('.fvc-mobile-menu').forEach(function(n){LINKS.forEach(function(k){if(!n.querySelector('[data-fvc-area="'+k.h+'"]'))n.appendChild(mk(k));});});
+    var foot=document.querySelector('footer');
+    if(foot){var ws=Array.prototype.slice.call(foot.querySelectorAll('a')).filter(function(a){return /worksafebc-approved/.test(a.getAttribute('href')||'');})[0];if(ws&&ws.parentNode){LINKS.forEach(function(k){if(!foot.querySelector('[data-fvc-area="'+k.h+'"]'))ws.parentNode.insertBefore(mk(k,ws.className||''),ws.nextSibling);});}}
+  }
+  if(document.readyState!=='loading')add();else document.addEventListener('DOMContentLoaded',add);
 })();</script>
 HTML;
 }
@@ -944,6 +1512,11 @@ function fvc_bridge_rest_approve_claim($req) {
     $wpdb->update($table, array('status' => 'approved', 'matched_post_id' => $listing_id), array('id' => $sid));
 
     fvc_bridge_send_claim_approved($email, $sub['contact_name'], $sub['clinic_name'], get_permalink($listing_id), $new_user);
+    // Auto-generate a starter clinic site (only if they don't already have one); owner refines it in the builder.
+    if ( function_exists('fvc_bridge_generate_site') && ! get_post_meta($listing_id, '_fvc_site_page', true) ) {
+        $gen = fvc_bridge_generate_site($listing_id, $user->ID);
+        fvc_bridge_log('auto-generate', is_wp_error($gen) ? ('err=' . $gen->get_error_message()) : ('site=' . $gen[0]));
+    }
     fvc_bridge_log('approve-claim', "sid=$sid user={$user->ID} post=$listing_id new_user=" . ($new_user ? '1' : '0'));
 
     return new WP_REST_Response(array(
@@ -958,28 +1531,35 @@ function fvc_bridge_rest_publish_post($req) {
     $p = $req->get_json_params();
     if ( ! is_array($p) ) $p = $req->get_params();
     $title   = sanitize_text_field($p['title'] ?? '');
-    $content = isset($p['content']) ? wp_kses_post($p['content']) : '';
+    // raw_html: store trusted authored HTML verbatim (allows <style>, grid, hover) — token-gated, no user input.
+    $raw     = ! empty($p['raw_html']);
+    $content = isset($p['content']) ? ($raw ? (string) $p['content'] : wp_kses_post($p['content'])) : '';
     if ( ! $title || ! $content ) return new WP_REST_Response(array('ok' => false, 'error' => 'title and content required'), 400);
 
     $status = (isset($p['status']) && $p['status'] === 'draft') ? 'draft' : 'publish';
     $slug   = ! empty($p['slug']) ? sanitize_title($p['slug']) : sanitize_title($title);
+    $post_type = (isset($p['post_type']) && $p['post_type'] === 'page') ? 'page' : 'post';
 
-    $existing = get_page_by_path($slug, OBJECT, 'post');
+    $existing = get_page_by_path($slug, OBJECT, $post_type);
     $postarr = array(
-        'post_type'    => 'post',
+        'post_type'    => $post_type,
         'post_status'  => $status,
         'post_title'   => $title,
-        'post_content' => $content,
+        'post_content' => wp_slash($content), // wp_insert_post unslashes; slash first so backslashes (JSON/JS) survive
         'post_excerpt' => sanitize_text_field($p['excerpt'] ?? ''),
         'post_name'    => $slug,
         'post_author'  => 1,
     );
     if ( $existing ) $postarr['ID'] = $existing->ID;
 
+    // wp_insert_post applies KSES (strips <style> etc.) for users without unfiltered_html.
+    // For trusted raw_html content, lift KSES around the insert, then restore it.
+    if ( $raw ) kses_remove_filters();
     $post_id = wp_insert_post($postarr, true);
+    if ( $raw ) kses_init_filters();
     if ( is_wp_error($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => $post_id->get_error_message()), 500);
 
-    if ( ! empty($p['category']) ) {
+    if ( $post_type === 'post' && ! empty($p['category']) ) {
         $cat = is_numeric($p['category']) ? (int) $p['category'] : get_cat_ID(sanitize_text_field($p['category']));
         if ( $cat ) wp_set_post_categories($post_id, array($cat));
     }
@@ -989,6 +1569,17 @@ function fvc_bridge_rest_publish_post($req) {
     if ( ! empty($p['meta_description']) && function_exists('update_post_meta') ) {
         update_post_meta($post_id, 'rank_math_description', sanitize_text_field($p['meta_description']));
     }
+    // Custom JSON-LD schema (FAQ, ItemList, etc.) — stored base64 (avoids slash/quote mangling),
+    // emitted in <head> by fvc_bridge_output_schema(). WP strips <script> from content, so we can't inline it.
+    if ( array_key_exists('schema_jsonld', $p) ) {
+        $sraw = is_string($p['schema_jsonld']) ? $p['schema_jsonld'] : wp_json_encode($p['schema_jsonld']);
+        if ( $sraw && json_decode($sraw) !== null ) {
+            update_post_meta($post_id, '_fvc_schema_b64', base64_encode($sraw));
+        } else {
+            delete_post_meta($post_id, '_fvc_schema_b64');
+        }
+    }
+    if ( $raw ) { update_post_meta($post_id, '_fvc_raw_html', 1); } else { delete_post_meta($post_id, '_fvc_raw_html'); }
 
     if ( $status === 'publish' ) fvc_bridge_indexnow_ping(get_permalink($post_id));
     fvc_bridge_log('publish-post', "post=$post_id status=$status " . ($existing ? 'updated' : 'created') . " title=$title");
@@ -1081,7 +1672,12 @@ function fvc_bridge_send_claim_approved($to, $contact, $clinic, $view_url, $new_
         '<p style="margin:0 0 18px;font-size:15px;line-height:1.6;color:#3f3f46;">You&#39;re verified, ' . esc_html($contact) . ' — you now have access to manage <strong>' . esc_html($clinic) . '</strong> on Find Vancouver Clinics.</p>'
       . $setup
       . '<table role="presentation" cellpadding="0" cellspacing="0" style="margin:12px 0 8px;"><tr><td style="border-radius:8px;background:#09BDB8;"><a href="' . esc_url($view_url) . '" style="display:inline-block;padding:12px 22px;font-size:15px;font-weight:600;color:#fff;text-decoration:none;">View your listing &rarr;</a></td></tr></table>'
-      . '<p style="margin:12px 0 0;font-size:13px;color:#6b6b6e;">Sign in at <a href="https://findvancouverclinics.com/wp-login.php" style="color:#0a8f8b;">findvancouverclinics.com/wp-login.php</a> to update your hours, services, and details.</p>';
+      . '<div style="margin:20px 0 4px;background:#f0fbfa;border:1px solid #cdeeec;border-radius:10px;padding:16px 18px;">'
+        . '<p style="margin:0 0 6px;font-size:14px;font-weight:700;color:#0a3d3b;">Your free clinic tools are ready</p>'
+        . '<p style="margin:0 0 12px;font-size:13.5px;line-height:1.6;color:#3f3f46;">Build a professional <strong>website</strong>, take <strong>online bookings</strong> with a built-in <strong>calendar</strong>, grow your <strong>Google reviews</strong>, and run a free <strong>SEO checkup</strong> &mdash; all free, no code.</p>'
+        . '<a href="https://findvancouverclinics.com/clinic-editor/" style="display:inline-block;padding:10px 18px;border-radius:999px;background:#09BDB8;color:#fff;font-size:14px;font-weight:600;text-decoration:none;">Build my free site &rarr;</a>'
+      . '</div>'
+      . '<p style="margin:16px 0 0;font-size:13px;color:#6b6b6e;">Sign in at <a href="https://findvancouverclinics.com/wp-login.php" style="color:#0a8f8b;">findvancouverclinics.com/wp-login.php</a> to update your hours, services, and details.</p>';
     $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>', 'Reply-To: Find Vancouver Clinics <claim@findvancouverclinics.com>');
     return wp_mail($to, 'You can now manage your listing on Find Vancouver Clinics', fvc_bridge_email_shell('You&#39;re verified — you can now manage your listing.', 'You&#39;re verified, ' . esc_html($contact) . '.', $inner), $headers);
 }
@@ -1257,4 +1853,388 @@ function fvc_bridge_submissions_page() {
         echo '</form></td></tr>';
     }
     echo '</tbody></table></div>';
+}
+
+// ============================================================
+//  Booking v1 (native) — services, availability, appointments,
+//  confirmation emails + .ics, and an iCal subscription feed.
+//  Patient PII is minimal + consented (PIPA-aware). No payments here
+//  (Stripe Checkout is a separate, keys-required add-on).
+// ============================================================
+function fvc_bridge_booking_table() { global $wpdb; return $wpdb->prefix . 'fvc_appointments'; }
+
+function fvc_bridge_booking_ensure_table() {
+    global $wpdb;
+    $t = fvc_bridge_booking_table();
+    if ( get_option('fvc_bridge_booking_db') === '2' ) return;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    $charset = $wpdb->get_charset_collate();
+    dbDelta("CREATE TABLE $t (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        listing_id BIGINT UNSIGNED NOT NULL,
+        service VARCHAR(160) DEFAULT '',
+        practitioner VARCHAR(160) DEFAULT '',
+        start_local DATETIME NOT NULL,
+        end_local DATETIME NOT NULL,
+        name VARCHAR(160) DEFAULT '',
+        email VARCHAR(190) DEFAULT '',
+        phone VARCHAR(60) DEFAULT '',
+        notes TEXT,
+        status VARCHAR(20) DEFAULT 'pending',
+        manage_key VARCHAR(40) DEFAULT '',
+        created_at DATETIME NOT NULL,
+        PRIMARY KEY (id),
+        KEY listing_id (listing_id),
+        KEY start_local (start_local)
+    ) $charset;");
+    update_option('fvc_bridge_booking_db', '2');
+}
+
+function fvc_bridge_booking_defaults($listing_id) {
+    $cats = wp_get_post_terms($listing_id, 'gd_placecategory', array('fields' => 'names'));
+    $svc = array();
+    foreach ( (array) $cats as $c ) { $svc[] = array('name' => $c, 'duration' => 45, 'price' => 0); }
+    if ( ! $svc ) $svc[] = array('name' => 'Appointment', 'duration' => 45, 'price' => 0);
+    return array(
+        'enabled' => true, 'externalUrl' => '',
+        'services' => $svc, 'practitioners' => array(),
+        'hours' => array(
+            'mon' => array('09:00','17:00'), 'tue' => array('09:00','17:00'),
+            'wed' => array('09:00','17:00'), 'thu' => array('09:00','19:00'),
+            'fri' => array('09:00','17:00'), 'sat' => array('10:00','14:00'), 'sun' => array(),
+        ),
+        'slotMinutes' => 45, 'timezone' => 'America/Vancouver',
+    );
+}
+function fvc_bridge_booking_get_config($listing_id) {
+    $c = get_post_meta($listing_id, '_fvc_booking', true);
+    if ( is_array($c) && ! empty($c) ) return array_merge(fvc_bridge_booking_defaults($listing_id), $c);
+    return fvc_bridge_booking_defaults($listing_id);
+}
+function fvc_bridge_booking_owns($listing_id) {
+    if ( fvc_bridge_has_valid_token() || current_user_can('manage_options') ) return true;
+    $p = get_post($listing_id); $uid = get_current_user_id();
+    return $p && $uid && (int) $p->post_author === $uid;
+}
+
+function fvc_bridge_rest_booking_config($req) {
+    $id = (int) $req->get_param('listing');
+    if ( ! $id ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing required'), 400);
+    $p = get_post($id);
+    if ( ! $p || $p->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    $cfg = fvc_bridge_booking_get_config($id);
+    $cfg['ok'] = true; $cfg['listingId'] = $id; $cfg['clinic'] = html_entity_decode($p->post_title, ENT_QUOTES);
+    return new WP_REST_Response($cfg, 200);
+}
+function fvc_bridge_rest_booking_config_save($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $cfg = array(
+        'enabled' => ! empty($b['enabled']),
+        'externalUrl' => esc_url_raw($b['externalUrl'] ?? ''),
+        'services' => array_values(array_map(function ($s) {
+            return array('name' => sanitize_text_field($s['name'] ?? ''), 'duration' => max(15, (int) ($s['duration'] ?? 45)), 'price' => max(0, (float) ($s['price'] ?? 0)));
+        }, (array) ($b['services'] ?? array()))),
+        'practitioners' => array_values(array_map('sanitize_text_field', (array) ($b['practitioners'] ?? array()))),
+        'hours' => (array) ($b['hours'] ?? array()),
+        'slotMinutes' => max(15, (int) ($b['slotMinutes'] ?? 45)),
+        'timezone' => sanitize_text_field($b['timezone'] ?? 'America/Vancouver'),
+    );
+    update_post_meta($id, '_fvc_booking', $cfg);
+    return new WP_REST_Response(array('ok' => true), 200);
+}
+
+function fvc_bridge_rest_booking_slots($req) {
+    $id = (int) $req->get_param('listing');
+    $date = preg_replace('/[^0-9\-]/', '', (string) $req->get_param('date'));
+    $pract = sanitize_text_field((string) $req->get_param('practitioner'));
+    if ( ! $id || ! $date ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing+date required'), 400);
+    $cfg = fvc_bridge_booking_get_config($id);
+    $svcMin = (int) $cfg['slotMinutes'];
+    $svcName = sanitize_text_field((string) $req->get_param('service'));
+    foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svcName ) { $svcMin = (int) $s['duration']; break; } }
+    if ( $svcMin < 15 ) $svcMin = 45;
+    $tz = new DateTimeZone($cfg['timezone']);
+    $day = DateTime::createFromFormat('Y-m-d', $date, $tz);
+    if ( ! $day ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad date'), 400);
+    $wk = strtolower(substr($day->format('l'), 0, 3));
+    $hours = isset($cfg['hours'][$wk]) ? $cfg['hours'][$wk] : array();
+    if ( count($hours) < 2 ) return new WP_REST_Response(array('ok' => true, 'date' => $date, 'slots' => array()), 200);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $booked = $wpdb->get_results($wpdb->prepare("SELECT start_local,end_local,practitioner FROM $t WHERE listing_id=%d AND status!='cancelled' AND DATE(start_local)=%s", $id, $date), ARRAY_A);
+    $parts = explode(':', $hours[0]); $oh = (int) $parts[0]; $om = (int) ($parts[1] ?? 0);
+    $parts = explode(':', $hours[1]); $ch = (int) $parts[0]; $cm = (int) ($parts[1] ?? 0);
+    $cur = clone $day; $cur->setTime($oh, $om);
+    $endw = clone $day; $endw->setTime($ch, $cm);
+    $now = new DateTime('now', $tz);
+    $slots = array(); $guard = 0;
+    while ( $guard++ < 200 ) {
+        $slotEnd = clone $cur; $slotEnd->modify('+' . $svcMin . ' minutes');
+        if ( $slotEnd > $endw ) break;
+        if ( $cur > $now ) {
+            $s = $cur->format('Y-m-d H:i:s'); $e = $slotEnd->format('Y-m-d H:i:s'); $clash = false;
+            foreach ( $booked as $bk ) {
+                if ( $pract && $bk['practitioner'] !== $pract ) continue;
+                if ( $s < $bk['end_local'] && $e > $bk['start_local'] ) { $clash = true; break; }
+            }
+            if ( ! $clash ) $slots[] = $cur->format('H:i');
+        }
+        $cur->modify('+' . $svcMin . ' minutes');
+    }
+    return new WP_REST_Response(array('ok' => true, 'date' => $date, 'slots' => $slots), 200);
+}
+
+function fvc_bridge_require_token_or_public($req) {
+    $ip = fvc_bridge_ip(); $k = 'fvc_bk_rl_' . md5($ip); $n = (int) get_transient($k);
+    if ( $n > 12 ) return new WP_Error('rate_limited', 'Too many requests', array('status' => 429));
+    set_transient($k, $n + 1, MINUTE_IN_SECONDS);
+    return true;
+}
+
+function fvc_bridge_booking_ics($appt, $cfg) {
+    $tz = new DateTimeZone($cfg['timezone']);
+    $start = DateTime::createFromFormat('Y-m-d H:i:s', $appt['start_local'], $tz);
+    $end   = DateTime::createFromFormat('Y-m-d H:i:s', $appt['end_local'], $tz);
+    $utc = new DateTimeZone('UTC');
+    $start->setTimezone($utc); $end->setTimezone($utc);
+    $stamp = gmdate('Ymd\THis\Z');
+    $summary = ($appt['service'] ?: 'Appointment') . ' — ' . $cfg['clinic'];
+    $desc = 'Booking at ' . $cfg['clinic'] . ($appt['practitioner'] ? (' with ' . $appt['practitioner']) : '');
+    return "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Find Vancouver Clinics//Booking//EN\r\nCALSCALE:GREGORIAN\r\nMETHOD:PUBLISH\r\n"
+        . "BEGIN:VEVENT\r\nUID:fvc-" . $appt['id'] . "@findvancouverclinics.com\r\nDTSTAMP:$stamp\r\n"
+        . "DTSTART:" . $start->format('Ymd\THis\Z') . "\r\nDTEND:" . $end->format('Ymd\THis\Z') . "\r\n"
+        . "SUMMARY:" . addcslashes($summary, ",;\\") . "\r\nDESCRIPTION:" . addcslashes($desc, ",;\\") . "\r\n"
+        . "STATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+}
+
+function fvc_bridge_rest_booking_create($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
+    $p = $id ? get_post($id) : null;
+    if ( ! $p || $p->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'clinic not found'), 404);
+    if ( empty($b['consent']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'consent required'), 400);
+    $cfg = fvc_bridge_booking_get_config($id);
+    $name = sanitize_text_field($b['name'] ?? ''); $email = sanitize_email($b['email'] ?? ''); $phone = sanitize_text_field($b['phone'] ?? '');
+    $svc = sanitize_text_field($b['service'] ?? ''); $pract = sanitize_text_field($b['practitioner'] ?? '');
+    $date = preg_replace('/[^0-9\-]/', '', $b['date'] ?? ''); $time = preg_replace('/[^0-9:]/', '', $b['time'] ?? '');
+    $notes = sanitize_textarea_field($b['notes'] ?? '');
+    if ( ! $name || ! is_email($email) || ! $date || ! $time ) return new WP_REST_Response(array('ok' => false, 'error' => 'missing details'), 400);
+    $dur = (int) $cfg['slotMinutes'];
+    foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svc ) { $dur = (int) $s['duration']; break; } }
+    if ( $dur < 15 ) $dur = 45;
+    $tz = new DateTimeZone($cfg['timezone']);
+    $start = DateTime::createFromFormat('Y-m-d H:i', $date . ' ' . $time, $tz);
+    if ( ! $start ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad time'), 400);
+    $end = clone $start; $end->modify('+' . $dur . ' minutes');
+    fvc_bridge_booking_ensure_table();
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $s = $start->format('Y-m-d H:i:s'); $e = $end->format('Y-m-d H:i:s');
+    if ( $pract ) {
+        $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND practitioner=%s AND %s<end_local AND %s>start_local", $id, $pract, $s, $e));
+    } else {
+        $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND %s<end_local AND %s>start_local", $id, $s, $e));
+    }
+    if ( $clash > 0 ) return new WP_REST_Response(array('ok' => false, 'error' => 'That time was just taken — please pick another slot.'), 409);
+    $key = wp_generate_password(24, false);
+    $wpdb->insert($t, array(
+        'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
+        'start_local' => $s, 'end_local' => $e, 'name' => $name, 'email' => $email, 'phone' => $phone,
+        'notes' => $notes, 'status' => 'pending', 'manage_key' => $key, 'created_at' => current_time('mysql'),
+    ));
+    $appt = array('id' => (int) $wpdb->insert_id, 'service' => $svc, 'practitioner' => $pract, 'start_local' => $s, 'end_local' => $e);
+    $cfg['clinic'] = html_entity_decode($p->post_title, ENT_QUOTES);
+    $when = $start->format('l, F j') . ' at ' . $start->format('g:i a');
+    $manageUrl = add_query_arg(array('appt' => $appt['id'], 'key' => $key), home_url('/booking-manage/'));
+    // patient confirmation
+    if ( function_exists('fvc_bridge_email_shell') ) {
+        $inner = '<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#3f3f46;">Thanks, ' . esc_html($name) . ' — your appointment request is in.</p>'
+            . '<div style="background:#f7f7f7;border-left:3px solid #09BDB8;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;">'
+            . '<strong>' . esc_html($cfg['clinic']) . '</strong><br>' . esc_html($svc ?: 'Appointment') . ($pract ? ' with ' . esc_html($pract) : '') . '<br>' . esc_html($when) . '</div>'
+            . '<p style="margin:16px 0 0;font-size:13px;color:#6b6b6e;">Need to change it? <a href="' . esc_url($manageUrl) . '" style="color:#0a8f8b;">Manage your booking</a>.</p>';
+        $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>');
+        wp_mail($email, 'Your appointment request — ' . $cfg['clinic'], fvc_bridge_email_shell('Your appointment request is in.', 'Appointment requested', $inner), $headers);
+        // clinic notification (owner)
+        $owner = get_userdata((int) $p->post_author);
+        $clinicEmail = $owner && is_email($owner->user_email) ? $owner->user_email : get_option('admin_email');
+        if ( is_email($clinicEmail) ) {
+            $ci = '<p style="margin:0 0 14px;font-size:15px;color:#3f3f46;">New booking request for <strong>' . esc_html($cfg['clinic']) . '</strong>:</p>'
+                . '<div style="background:#f7f7f7;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;">'
+                . esc_html($name) . ' &middot; ' . esc_html($email) . ($phone ? ' &middot; ' . esc_html($phone) : '') . '<br>'
+                . esc_html($svc ?: 'Appointment') . ($pract ? ' with ' . esc_html($pract) : '') . '<br>' . esc_html($when)
+                . ($notes ? '<br><em>' . esc_html($notes) . '</em>' : '') . '</div>';
+            wp_mail($clinicEmail, 'New booking request — ' . $name, fvc_bridge_email_shell('New booking request.', 'New booking request', $ci), $headers);
+        }
+    }
+    return new WP_REST_Response(array('ok' => true, 'id' => $appt['id'], 'when' => $when, 'manageUrl' => $manageUrl, 'icsUrl' => add_query_arg(array('appt' => $appt['id'], 'key' => $key), rest_url('fvc-bridge/v1/booking-ics'))), 200);
+}
+
+function fvc_bridge_rest_booking_list($req) {
+    $id = (int) $req->get_param('listing');
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT id,service,practitioner,start_local,end_local,name,email,phone,status FROM $t WHERE listing_id=%d ORDER BY start_local DESC LIMIT 500", $id), ARRAY_A);
+    $feedKey = get_post_meta($id, '_fvc_booking_feedkey', true);
+    if ( ! $feedKey ) { $feedKey = wp_generate_password(20, false); update_post_meta($id, '_fvc_booking_feedkey', $feedKey); }
+    $feedUrl = add_query_arg(array('listing' => $id, 'key' => $feedKey), rest_url('fvc-bridge/v1/booking-feed'));
+    return new WP_REST_Response(array('ok' => true, 'appointments' => $rows ?: array(), 'clinic' => html_entity_decode(get_the_title($id), ENT_QUOTES), 'feedUrl' => $feedUrl), 200);
+}
+function fvc_bridge_rest_booking_status($req) {
+    $b = $req->get_json_params(); $aid = (int) ($b['id'] ?? 0); $status = sanitize_text_field($b['status'] ?? '');
+    if ( ! $aid || ! in_array($status, array('confirmed', 'cancelled', 'pending'), true) ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
+    if ( ! $row ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    $key = sanitize_text_field($b['key'] ?? '');
+    $allowed = fvc_bridge_booking_owns((int) $row['listing_id']) || ( $key && hash_equals($row['manage_key'], $key) && $status === 'cancelled' );
+    if ( ! $allowed ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $wpdb->update($t, array('status' => $status), array('id' => $aid));
+    return new WP_REST_Response(array('ok' => true, 'status' => $status), 200);
+}
+function fvc_bridge_rest_booking_ics($req) {
+    $aid = (int) $req->get_param('appt'); $key = sanitize_text_field((string) $req->get_param('key'));
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
+    if ( ! $row || ! $key || ! hash_equals($row['manage_key'], $key) ) { status_header(404); echo 'Not found'; exit; }
+    $cfg = fvc_bridge_booking_get_config((int) $row['listing_id']);
+    $cfg['clinic'] = html_entity_decode(get_the_title((int) $row['listing_id']), ENT_QUOTES);
+    nocache_headers();
+    header('Content-Type: text/calendar; charset=utf-8');
+    header('Content-Disposition: attachment; filename="appointment.ics"');
+    echo fvc_bridge_booking_ics($row, $cfg);
+    exit;
+}
+function fvc_bridge_rest_booking_feed($req) {
+    $id = (int) $req->get_param('listing'); $key = sanitize_text_field((string) $req->get_param('key'));
+    if ( ! $id ) { status_header(404); echo 'Not found'; exit; }
+    $feedKey = get_post_meta($id, '_fvc_booking_feedkey', true);
+    if ( ! $feedKey ) { $feedKey = wp_generate_password(20, false); update_post_meta($id, '_fvc_booking_feedkey', $feedKey); }
+    if ( ! $key || ! hash_equals($feedKey, $key) ) { status_header(403); echo 'Forbidden'; exit; }
+    $cfg = fvc_bridge_booking_get_config($id);
+    $cfg['clinic'] = html_entity_decode(get_the_title($id), ENT_QUOTES);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM $t WHERE listing_id=%d AND status!='cancelled' AND start_local>=%s ORDER BY start_local ASC LIMIT 500", $id, gmdate('Y-m-d 00:00:00', time() - 86400)), ARRAY_A);
+    nocache_headers();
+    header('Content-Type: text/calendar; charset=utf-8');
+    $out = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Find Vancouver Clinics//Booking//EN\r\nX-WR-CALNAME:" . addcslashes($cfg['clinic'] . ' bookings', ",;\\") . "\r\n";
+    foreach ( (array) $rows as $r ) {
+        $body = fvc_bridge_booking_ics($r, $cfg);
+        if ( preg_match('/BEGIN:VEVENT.*END:VEVENT/s', $body, $m) ) $out .= $m[0] . "\r\n";
+    }
+    $out .= "END:VCALENDAR\r\n";
+    echo $out; exit;
+}
+
+// ============================================================
+//  Auto-generate a starter clinic site (Noir) on claim approval.
+//  A compact server-side render so a site is LIVE the moment an owner
+//  is approved; they then refine it in the full builder (/clinic-editor)
+//  which republishes the richer version. Kept intentionally simple.
+// ============================================================
+function fvc_bridge_render_starter($listing_id) {
+    global $wpdb;
+    $p = get_post($listing_id);
+    if ( ! $p ) return '';
+    $d = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}geodir_gd_place_detail WHERE post_id=%d", $listing_id), ARRAY_A) ?: array();
+    $yes = function ($v) { return $v === '1' || $v === 1 || $v === 'Yes'; };
+    $name  = html_entity_decode($p->post_title, ENT_QUOTES);
+    $short = trim(preg_split('/\s+/', $name)[0]);
+    $hood  = $d['neighbourhood'] ?? ''; $city = $d['city'] ?? 'Vancouver';
+    $loc   = $hood ? ($hood . ', ' . $city) : $city;
+    $addr  = trim($d['street'] ?? ''); $phone = $d['l'] ?? ''; $phoneRaw = preg_replace('/\D/', '', $phone);
+    $hours = $d['business_hours'] ?? 'Call for hours';
+    $rating = isset($d['google_rating']) ? (float) $d['google_rating'] : 0;
+    $reviews = isset($d['google_review_count']) ? (int) $d['google_review_count'] : 0;
+    $cats = wp_get_post_terms($listing_id, 'gd_placecategory', array('fields' => 'names'));
+    if ( ! $cats ) $cats = array('Appointment');
+    $icbc = $yes($d['icbc_approved'] ?? ''); $db = $yes($d['direct_billing'] ?? ''); $ob = $yes($d['online_booking_available'] ?? '');
+    $bookUrl = home_url('/book/?clinic=' . $listing_id);
+    $e = 'esc_html'; $tel = 'tel:' . $phoneRaw;
+
+    $DESC = array('Physiotherapy'=>'Hands-on and exercise-based care for injury, pain and recovery.','Chiropractic'=>'Adjustments and manual therapy to relieve pain and restore movement.','Massage Therapy'=>'Registered therapeutic massage to ease tension and speed recovery.','Acupuncture'=>'Traditional acupuncture to manage pain and support healing.','Naturopath'=>'Natural, whole-body care tailored to you.','Kinesiology'=>'Active rehab to rebuild strength and movement.');
+    $svcCards = '';
+    foreach ( $cats as $c ) { $svcCards .= '<div class="cs-card"><h3>' . $e($c) . '</h3><p>' . $e($DESC[$c] ?? ('Professional ' . strtolower($c) . ' care.')) . '</p></div>'; }
+    $feats = array(); if ($icbc) $feats[] = 'ICBC approved'; if ($db) $feats[] = 'Direct billing'; if ($ob) $feats[] = 'Online booking'; $feats[] = ($hood ?: 'Vancouver') . ' location';
+    $featPills = ''; foreach ($feats as $f) $featPills .= '<span class="cs-feat">' . $e($f) . '</span>';
+    $stats = array(
+        $rating > 0 ? array('&#9733; ' . number_format($rating, 1), 'Rated by ' . $reviews) : array('Trusted', 'Local clinic'),
+        array((string) count($cats), 'Services in-house'),
+        $db ? array('$0', 'With direct billing') : ($icbc ? array('ICBC', 'Approved') : array('Same-week', 'Appointments')),
+        $ob ? array('Online', 'Booking available') : array($hood ?: 'Vancouver', 'Location'),
+    );
+    $statHtml = ''; foreach ($stats as $s) $statHtml .= '<div class="cs-stat"><div class="n">' . $s[0] . '</div><div class="l">' . $e($s[1]) . '</div></div>';
+    $chip = $rating > 0 ? ('<span class="cs-chip"><b>&#9733; ' . number_format($rating, 1) . '</b> ' . $reviews . ' reviews &middot; ' . $e($loc) . '</span>') : ('<span class="cs-chip">' . $e($loc) . '</span>');
+    $tagline = count($cats) > 1 ? ('Multidisciplinary care in ' . $e($loc) . ' &mdash; a full team under one roof.') : ($e($cats[0]) . ' in ' . $e($loc) . '.');
+
+    $css = ".cs{background:#0a0a0b;color:#fff;font-family:'Plus Jakarta Sans',-apple-system,Segoe UI,Arial,sans-serif;line-height:1.6;}"
+      . ".cs *{box-sizing:border-box;margin:0;}.cs img{max-width:100%;display:block;}.cs a{color:inherit;text-decoration:none;}"
+      . ".cs-wrap{max-width:1080px;margin:0 auto;padding:0 22px;}"
+      . ".cs-hdr{position:sticky;top:0;z-index:40;background:rgba(10,10,11,.72);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border-bottom:1px solid rgba(255,255,255,.1);}"
+      . ".cs-hdr-in{max-width:1080px;margin:0 auto;padding:14px 22px;display:flex;align-items:center;justify-content:space-between;gap:16px;}"
+      . ".cs-logo{font-weight:700;font-size:20px;letter-spacing:-.4px;}.cs-btn{display:inline-block;background:linear-gradient(135deg,#fff,#c9c9ce);color:#0a0a0b;padding:11px 22px;border-radius:999px;font-weight:600;font-size:14.5px;}"
+      . ".cs-btn-ghost{background:transparent;color:#fff;border:1px solid rgba(255,255,255,.3);}"
+      . ".cs-hero{padding:96px 22px 84px;text-align:left;background:radial-gradient(600px 300px at 15% 0%,rgba(255,255,255,.08),transparent 60%),#0a0a0b;}"
+      . ".cs-hero-in{max-width:1080px;margin:0 auto;}.cs-chip{display:inline-flex;align-items:center;gap:8px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);padding:7px 14px;border-radius:999px;font-size:13px;font-weight:600;margin-bottom:20px;}.cs-chip b{color:#ffd24a;}"
+      . ".cs-h1{font-size:clamp(34px,5.6vw,56px);font-weight:600;line-height:1.04;letter-spacing:-1.6px;max-width:16ch;}"
+      . ".cs-tag{color:rgba(255,255,255,.78);font-size:clamp(16px,2vw,20px);margin-top:18px;max-width:54ch;}.cs-cta{display:flex;flex-wrap:wrap;gap:12px;margin-top:30px;}"
+      . ".cs-trust{max-width:1080px;margin:-40px auto 0;padding:0 22px;position:relative;z-index:5;}.cs-trust-in{background:#151517;border:1px solid rgba(255,255,255,.1);border-radius:16px;display:grid;grid-template-columns:repeat(4,1fr);overflow:hidden;}"
+      . ".cs-stat{padding:22px 20px;border-right:1px solid rgba(255,255,255,.1);}.cs-stat:last-child{border-right:0;}.cs-stat .n{font-size:26px;font-weight:600;background:linear-gradient(135deg,#fff,#c9c9ce);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;}.cs-stat .l{color:rgba(255,255,255,.6);font-size:13px;margin-top:4px;}"
+      . ".cs-sec{padding:70px 0;border-top:1px solid rgba(255,255,255,.1);}.cs-kick{color:#fff;font-weight:600;font-size:12.5px;letter-spacing:1.6px;text-transform:uppercase;margin-bottom:12px;opacity:.7;}.cs-h2{font-size:clamp(26px,3.6vw,36px);font-weight:600;letter-spacing:-.8px;}"
+      . ".cs-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:16px;margin-top:32px;}.cs-card{background:#151517;border:1px solid rgba(255,255,255,.1);border-radius:16px;padding:24px;}.cs-card h3{font-size:18px;font-weight:600;margin-bottom:8px;}.cs-card p{color:rgba(255,255,255,.6);font-size:14px;}"
+      . ".cs-feats{display:flex;flex-wrap:wrap;gap:10px;margin-top:30px;}.cs-feat{background:#151517;border:1px solid rgba(255,255,255,.1);border-radius:999px;padding:10px 16px;font-size:14px;font-weight:500;}.cs-feat:before{content:'\\2713 ';color:#fff;}"
+      . ".cs-visit{display:grid;grid-template-columns:1fr;gap:18px;margin-top:30px;color:rgba(255,255,255,.8);font-size:16px;}.cs-visit b{color:#fff;}"
+      . ".cs-final{margin:70px 0;padding:60px 28px;text-align:center;border-radius:22px;background:linear-gradient(160deg,#1a1a1d,#0c0c0d);border:1px solid rgba(255,255,255,.1);}.cs-final h2{font-size:clamp(26px,3.6vw,34px);font-weight:600;}.cs-final p{color:rgba(255,255,255,.68);margin-top:10px;}"
+      . ".cs-foot{border-top:1px solid rgba(255,255,255,.1);padding:40px 0;color:rgba(255,255,255,.55);font-size:14px;}.cs-foot-in{max-width:1080px;margin:0 auto;padding:0 22px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px;}"
+      . "@media(max-width:760px){.cs-trust-in{grid-template-columns:1fr 1fr;}.cs-stat:nth-child(2){border-right:0;}.cs-stat:nth-child(1),.cs-stat:nth-child(2){border-bottom:1px solid rgba(255,255,255,.1);}}"
+      . ".cs .cs-h1,.cs .cs-h2,.cs .cs-card h3,.cs .cs-final h2,.cs .cs-logo{color:#fff !important;}.cs .cs-h1{font-size:clamp(34px,5.6vw,56px) !important;line-height:1.04;}.cs .cs-h2{font-size:clamp(26px,3.6vw,36px) !important;}";
+
+    $html = '<style>' . $css . '</style><div class="cs t-noir">'
+      . '<header class="cs-hdr"><div class="cs-hdr-in"><a class="cs-logo" href="#top"><b>' . $e($short) . '</b></a><a class="cs-btn" href="' . esc_url($bookUrl) . '">Book now</a></div></header>'
+      . '<section class="cs-hero" id="top"><div class="cs-hero-in">' . $chip . '<h1 class="cs-h1">' . $e($name) . '</h1><p class="cs-tag">' . $tagline . '</p>'
+      . '<div class="cs-cta"><a class="cs-btn" href="' . esc_url($bookUrl) . '">Book now</a>' . ($phoneRaw ? '<a class="cs-btn cs-btn-ghost" href="' . $tel . '">Call ' . $e($phone) . '</a>' : '') . '</div></div></section>'
+      . '<div class="cs-trust"><div class="cs-trust-in">' . $statHtml . '</div></div>'
+      . '<div class="cs-wrap">'
+      . '<section class="cs-sec"><p class="cs-kick">Services</p><h2 class="cs-h2">What we offer</h2><div class="cs-grid">' . $svcCards . '</div></section>'
+      . '<section class="cs-sec"><p class="cs-kick">Why patients choose us</p><h2 class="cs-h2">Care made simple</h2><div class="cs-feats">' . $featPills . '</div></section>'
+      . '<section class="cs-sec"><p class="cs-kick">Visit</p><h2 class="cs-h2">Come see us</h2><div class="cs-visit">' . ($addr ? '<div><b>Address</b><br>' . $e($addr) . '</div>' : '') . ($phone ? '<div><b>Phone</b><br><a href="' . $tel . '">' . $e($phone) . '</a></div>' : '') . '<div><b>Hours</b><br>' . $e($hours) . '</div></div></section>'
+      . '<div class="cs-final"><h2>Ready to feel better?</h2><p>' . ($icbc ? 'ICBC approved &middot; ' : '') . ($db ? 'Direct billing &middot; ' : '') . 'Book online today</p><div class="cs-cta" style="justify-content:center;margin-top:24px;"><a class="cs-btn" href="' . esc_url($bookUrl) . '">Book now</a></div></div>'
+      . '</div><footer class="cs-foot"><div class="cs-foot-in"><span><b style="color:#fff;">' . $e($name) . '</b>' . ($addr ? ' &middot; ' . $e($addr) : '') . '</span><span>Built with <a style="color:rgba(255,255,255,.75);" href="' . home_url('/') . '">Find Vancouver Clinics</a></span></div></footer>'
+      . '</div>';
+    return $html;
+}
+
+// Create/update the clinic's white-label site page from the starter render. Returns [site_id, url] or WP_Error.
+function fvc_bridge_generate_site($listing_id, $author = 0) {
+    $listing = get_post($listing_id);
+    if ( ! $listing || $listing->post_type !== 'gd_place' ) return new WP_Error('nolisting', 'listing not found');
+    $html = fvc_bridge_render_starter($listing_id);
+    if ( strlen($html) < 50 ) return new WP_Error('empty', 'render failed');
+    $site_id = (int) get_post_meta($listing_id, '_fvc_site_page', true);
+    if ( $site_id && ! get_post($site_id) ) $site_id = 0;
+    $title = html_entity_decode($listing->post_title, ENT_QUOTES);
+    if ( ! $author ) $author = (int) $listing->post_author ?: 1;
+    kses_remove_filters();
+    if ( $site_id ) {
+        $r = wp_update_post(array('ID' => $site_id, 'post_content' => wp_slash($html), 'post_title' => $title), true);
+    } else {
+        $r = wp_insert_post(array('post_type' => 'page', 'post_status' => 'publish', 'post_title' => $title,
+            'post_name' => sanitize_title($title), 'post_content' => wp_slash($html), 'post_author' => $author), true);
+    }
+    kses_init_filters();
+    if ( is_wp_error($r) ) return $r;
+    if ( ! $site_id ) $site_id = (int) $r;
+    update_post_meta($site_id, '_fvc_raw_html', 1);
+    update_post_meta($site_id, '_wp_page_template', 'elementor_canvas');
+    update_post_meta($site_id, '_fvc_site_listing', $listing_id);
+    update_post_meta($listing_id, '_fvc_site_page', $site_id);
+    if ( function_exists('fvc_bridge_indexnow_ping') ) fvc_bridge_indexnow_ping(get_permalink($site_id));
+    return array($site_id, get_permalink($site_id));
+}
+
+// Token/owner endpoint to generate (or regenerate) a starter site — also used for testing.
+function fvc_bridge_rest_clinic_generate($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
+    if ( ! $id ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing_id required'), 400);
+    if ( ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $res = fvc_bridge_generate_site($id, get_current_user_id());
+    if ( is_wp_error($res) ) return new WP_REST_Response(array('ok' => false, 'error' => $res->get_error_message()), 500);
+    return new WP_REST_Response(array('ok' => true, 'post_id' => $res[0], 'view' => $res[1]), 200);
 }
