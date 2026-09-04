@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.120
+ * Version: 1.16.121
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.120');
+define('FVC_BRIDGE_VERSION',    '1.16.121');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -207,6 +207,12 @@ add_action('rest_api_init', function () {
         'permission_callback' => function () { return is_user_logged_in() || fvc_bridge_has_valid_token(); },
         'callback'            => 'fvc_bridge_rest_clinic_unpublish',
     ));
+    // Owner-gated external-website SEO scan (1 / 30 days per listing).
+    register_rest_route('fvc-bridge/v1', '/seo-scan', array(
+        'methods'             => 'POST',
+        'permission_callback' => function () { return is_user_logged_in() || fvc_bridge_has_valid_token(); },
+        'callback'            => 'fvc_bridge_rest_seo_scan',
+    ));
     // ---- Booking v1 (native) ----
     register_rest_route('fvc-bridge/v1', '/booking-config', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_config'));
     register_rest_route('fvc-bridge/v1', '/booking-config-save', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_config_save'));
@@ -327,6 +333,164 @@ function fvc_bridge_rest_clinic_me($req) {
     $u = wp_get_current_user();
     return new WP_REST_Response(array('ok' => true, 'userId' => $uid, 'displayName' => $u->display_name,
         'isAdmin' => current_user_can('manage_options'), 'listings' => $listings), 200);
+}
+
+// ---- External-website SEO scan (deterministic; owner-gated; 1 scan / 30 days) ----
+
+// SSRF guard: refuse loopback / private / link-local hosts even for a registered site.
+function fvc_bridge_seo_blocked_host($host) {
+    $host = strtolower($host);
+    if ($host === 'localhost' || substr($host, -6) === '.local' || substr($host, -10) === '.localhost') return true;
+    if (filter_var($host, FILTER_VALIDATE_IP) && !filter_var($host, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return true;
+    return false;
+}
+
+// Deterministic on-page SEO checks against fetched HTML. Returns checks[] + score.
+function fvc_bridge_seo_run_checks($html, $finalUrl, $code) {
+    $checks = array();
+    $https = (stripos($finalUrl, 'https://') === 0);
+    $add = function ($key, $state, $label, $detail, $fix = '') use (&$checks) {
+        $checks[] = array('key' => $key, 'state' => $state, 'label' => $label, 'detail' => $detail, 'fix' => $fix);
+    };
+
+    $add('loads', ($code >= 200 && $code < 400) ? 'pass' : 'fail', 'Website loads',
+        ($code >= 200 && $code < 400) ? 'Your site responded with HTTP ' . $code . '.' : 'Your site returned HTTP ' . $code . ' — search engines may not be able to read it.',
+        ($code >= 200 && $code < 400) ? '' : 'Make sure your website is online and publicly reachable.');
+
+    $add('https', $https ? 'pass' : 'fail', 'Secure (HTTPS)',
+        $https ? 'Your site is served over a secure HTTPS connection.' : 'Your site is not on HTTPS — Google favours secure sites and browsers warn visitors.',
+        $https ? '' : 'Add an SSL certificate (most hosts include one free) and redirect http to https.');
+
+    if (preg_match('#<title[^>]*>(.*?)</title>#is', $html, $m)) {
+        $t = trim(html_entity_decode(strip_tags($m[1]), ENT_QUOTES)); $len = function_exists('mb_strlen') ? mb_strlen($t) : strlen($t);
+        $state = ($len >= 10 && $len <= 65) ? 'pass' : 'warn';
+        $add('title', $state, 'Page title', 'Title (' . $len . ' chars): "' . (function_exists('mb_substr') ? mb_substr($t, 0, 80) : substr($t, 0, 80)) . '".',
+            $state === 'pass' ? '' : 'Aim for a 10–60 character title: clinic name + main service + city.');
+    } else {
+        $add('title', 'fail', 'Page title', 'No <title> tag — this is the headline Google shows in results.', 'Add a descriptive <title>, e.g. "Kitsilano Physiotherapy | Your Clinic".');
+    }
+
+    if (preg_match('#<meta[^>]+name=["\']description["\'][^>]*>#is', $html, $m)) {
+        $desc = ''; if (preg_match('#content=["\'](.*?)["\']#is', $m[0], $mm)) $desc = trim(html_entity_decode($mm[1], ENT_QUOTES));
+        $len = function_exists('mb_strlen') ? mb_strlen($desc) : strlen($desc);
+        $state = ($len >= 50 && $len <= 165) ? 'pass' : 'warn';
+        $add('desc', $state, 'Meta description', $len ? ('Description is ' . $len . ' characters.') : 'A description tag exists but is empty.',
+            $state === 'pass' ? '' : 'Write a 50–160 character summary that invites a click (services, location, "book online").');
+    } else {
+        $add('desc', 'fail', 'Meta description', 'No meta description — Google will use random page text for your snippet.', 'Add a meta description summarising your clinic and services.');
+    }
+
+    $h1 = preg_match_all('#<h1[\s>]#i', $html, $x);
+    $state = ($h1 === 1) ? 'pass' : ($h1 === 0 ? 'fail' : 'warn');
+    $add('h1', $state, 'Main heading (H1)', $h1 === 1 ? 'Exactly one H1 heading — good.' : ($h1 === 0 ? 'No H1 heading found.' : $h1 . ' H1 headings found (usually there should be one).'),
+        $state === 'pass' ? '' : 'Use a single, clear H1 that states what your clinic does.');
+
+    $vp = (bool) preg_match('#<meta[^>]+name=["\']viewport["\']#i', $html);
+    $add('viewport', $vp ? 'pass' : 'fail', 'Mobile-friendly', $vp ? 'A viewport tag is set, so the page adapts to phones.' : 'No viewport tag — the page may not scale on phones, where most patients search.',
+        $vp ? '' : 'Add <meta name="viewport" content="width=device-width, initial-scale=1">.');
+
+    $can = (bool) preg_match('#<link[^>]+rel=["\']canonical["\']#i', $html);
+    $add('canonical', $can ? 'pass' : 'warn', 'Canonical link', $can ? 'A canonical URL is declared.' : 'No canonical tag — it helps avoid duplicate-content confusion.',
+        $can ? '' : 'Add <link rel="canonical"> pointing to the page\'s main URL.');
+
+    $noindex = (bool) preg_match('#<meta[^>]+name=["\']robots["\'][^>]*content=["\'][^"\']*noindex#i', $html);
+    $add('index', $noindex ? 'fail' : 'pass', 'Indexable by Google', $noindex ? 'This page is set to "noindex" — Google is told to hide it.' : 'No blocking robots tag — Google can index the page.',
+        $noindex ? 'Remove the noindex robots tag so your site can appear in search.' : '');
+
+    $og = (bool) preg_match('#<meta[^>]+property=["\']og:(title|image)["\']#i', $html);
+    $add('og', $og ? 'pass' : 'warn', 'Social sharing tags', $og ? 'Open Graph tags are present, so shared links preview nicely.' : 'No Open Graph tags — links shared on Facebook or in messages won\'t show a title/image.',
+        $og ? '' : 'Add og:title, og:description and og:image meta tags.');
+
+    $ld = (bool) preg_match('#<script[^>]+type=["\']application/ld\+json["\']#i', $html);
+    $add('schema', $ld ? 'pass' : 'warn', 'Structured data', $ld ? 'JSON-LD structured data found — helps Google understand your clinic.' : 'No structured data — a LocalBusiness schema can earn richer search results.',
+        $ld ? '' : 'Add LocalBusiness (or MedicalClinic) JSON-LD with your name, address, phone and hours.');
+
+    $imgs = preg_match_all('#<img\b[^>]*>#i', $html, $im);
+    if ($imgs > 0) {
+        $withAlt = 0; foreach ($im[0] as $tag) { if (preg_match('#\balt=["\'][^"\']+["\']#i', $tag)) $withAlt++; }
+        $pct = (int) round($withAlt / $imgs * 100);
+        $state = $pct >= 80 ? 'pass' : ($pct >= 40 ? 'warn' : 'fail');
+        $add('alt', $state, 'Image alt text', $pct . '% of images (' . $withAlt . '/' . $imgs . ') have alt text.',
+            $state === 'pass' ? '' : 'Add descriptive alt text to images — good for accessibility and image search.');
+    } else {
+        $add('alt', 'na', 'Image alt text', 'No images detected on the homepage.', '');
+    }
+
+    $lang = (bool) preg_match('#<html[^>]+lang=["\'][a-z]#i', $html);
+    $add('lang', $lang ? 'pass' : 'warn', 'Language set', $lang ? 'The page declares its language.' : 'No lang attribute on the <html> tag.',
+        $lang ? '' : 'Add lang="en" to your <html> tag.');
+
+    $stripped = preg_replace('#<(script|style)\b[^>]*>.*?</\1>#is', ' ', $html);
+    $text = trim(preg_replace('/\s+/', ' ', strip_tags($stripped)));
+    $words = $text === '' ? 0 : count(explode(' ', $text));
+    $state = $words >= 300 ? 'pass' : ($words >= 120 ? 'warn' : 'fail');
+    $add('content', $state, 'Content depth', $words . ' words of text on the homepage.',
+        $state === 'pass' ? '' : 'Add more helpful text (services, conditions treated, what to expect) — thin pages rank poorly.');
+
+    $scored = 0; $total = 0;
+    foreach ($checks as $c) {
+        if ($c['state'] === 'na') continue;
+        $total++;
+        if ($c['state'] === 'pass') $scored += 1; elseif ($c['state'] === 'warn') $scored += 0.5;
+    }
+    $pct = $total ? (int) round($scored / $total * 100) : 0;
+    return array('checks' => $checks, 'score' => $pct, 'passed' => $scored, 'total' => $total);
+}
+
+function fvc_bridge_rest_seo_scan($req) {
+    global $wpdb;
+    $id = (int) ($req->get_param('listing') ?: $req->get_param('listingId'));
+    if ( ! $id ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing id required'), 400);
+    $post = get_post($id);
+    if ( ! $post || $post->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+
+    $is_token = fvc_bridge_has_valid_token();
+    if ( ! $is_token && ! current_user_can('manage_options') && (int) $post->post_author !== get_current_user_id() ) {
+        return new WP_REST_Response(array('ok' => false, 'error' => 'forbidden'), 403);
+    }
+
+    $row = $wpdb->get_row($wpdb->prepare("SELECT website FROM {$wpdb->prefix}geodir_gd_place_detail WHERE post_id = %d", $id), ARRAY_A);
+    $url = trim($row['website'] ?? '');
+    if ( $url === '' ) return new WP_REST_Response(array('ok' => false, 'error' => 'no_website', 'message' => 'No website is on file for this clinic yet. Add your website to your listing, then run the scan.'), 200);
+    if ( ! preg_match('#^https?://#i', $url) ) $url = 'https://' . ltrim($url, '/');
+    $host = parse_url($url, PHP_URL_HOST);
+    if ( ! $host || strpos($host, '.') === false ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad_url', 'message' => 'The website on file (' . esc_html($row['website']) . ') doesn\'t look like a valid address.'), 200);
+    if ( fvc_bridge_seo_blocked_host($host) ) return new WP_REST_Response(array('ok' => false, 'error' => 'blocked', 'message' => 'That address can\'t be scanned.'), 200);
+
+    $meta_key = '_fvc_seo_scan';
+    $prev = get_post_meta($id, $meta_key, true);
+    $now = time();
+    $force = $is_token && ($req->get_param('force') == '1' || $req->get_param('force') === true);
+    if ( is_array($prev) && ! $force && isset($prev['ts']) && ($now - (int) $prev['ts']) < 30 * DAY_IN_SECONDS ) {
+        $prev['cached'] = true;
+        $prev['nextScanTs'] = (int) $prev['ts'] + 30 * DAY_IN_SECONDS;
+        return new WP_REST_Response($prev, 200);
+    }
+
+    $resp = wp_remote_get($url, array(
+        'timeout' => 12, 'redirection' => 3,
+        'user-agent' => 'FindVancouverClinics-SEO-Scan/1.0 (+https://findvancouverclinics.com)',
+        'limit_response_size' => 2000000,
+        'headers' => array('Accept' => 'text/html'),
+    ));
+    if ( is_wp_error($resp) ) {
+        return new WP_REST_Response(array('ok' => false, 'error' => 'unreachable', 'message' => 'We couldn\'t reach ' . esc_html($host) . '. Check the site is online and the address on your listing is correct.'), 200);
+    }
+    $code = (int) wp_remote_retrieve_response_code($resp);
+    $html = (string) wp_remote_retrieve_body($resp);
+    if ( strlen($html) > 2000000 ) $html = substr($html, 0, 2000000);
+
+    $res = fvc_bridge_seo_run_checks($html, $url, $code);
+    $pct = $res['score'];
+    $grade = $pct >= 85 ? 'Excellent' : ($pct >= 70 ? 'Good' : ($pct >= 50 ? 'Needs work' : 'Poor'));
+
+    $report = array(
+        'ok' => true, 'url' => $host, 'fullUrl' => $url, 'ts' => $now,
+        'score' => $pct, 'grade' => $grade, 'passed' => $res['passed'], 'total' => $res['total'],
+        'checks' => $res['checks'], 'cached' => false, 'nextScanTs' => $now + 30 * DAY_IN_SECONDS,
+    );
+    update_post_meta($id, $meta_key, $report);
+    return new WP_REST_Response($report, 200);
 }
 
 // Take a clinic's site offline (draft) — same ownership rules as clinic-publish.
