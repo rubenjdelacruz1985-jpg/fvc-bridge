@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.110
+ * Version: 1.16.111
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.110');
+define('FVC_BRIDGE_VERSION',    '1.16.111');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1292,6 +1292,25 @@ body .fvc-hero-guide:hover{color:#4fe8e3!important;gap:10px!important;}
   }
   if(document.readyState!=='loading')run();else document.addEventListener('DOMContentLoaded',run);
 })();</script>
+HTML;
+}
+
+// Homepage "Browse by specialty" cards — Option B (photo tile + white label bar) instead of the
+// dark full-photo overlay tile. Lighter, name always legible on white. Overrides the widget CSS.
+add_action('wp_head', 'fvc_bridge_home_cards_css', 34);
+function fvc_bridge_home_cards_css() {
+    if ( ! is_front_page() ) return;
+    echo <<<'HTML'
+<style id="fvc-cards-optionb">
+body .fvc-cats-grid .fvc-cat-card{display:flex!important;flex-direction:column!important;height:300px!important;background:#fff!important;border:1px solid rgba(9,9,11,.10)!important;border-radius:12px!important;overflow:hidden!important;box-shadow:0 2px 10px rgba(0,0,0,.06)!important;transition:transform .18s ease,box-shadow .18s ease!important;}
+body .fvc-cats-grid .fvc-cat-card:hover{transform:translateY(-3px)!important;box-shadow:0 16px 36px rgba(0,0,0,.14)!important;}
+body .fvc-cats-grid .fvc-cat-img{position:relative!important;inset:auto!important;flex:1 1 auto!important;min-height:0!important;}
+body .fvc-cats-grid .fvc-cat-card:hover .fvc-cat-img{transform:none!important;}
+body .fvc-cats-grid .fvc-cat-overlay{display:none!important;}
+body .fvc-cats-grid .fvc-cat-body{position:relative!important;bottom:auto!important;padding:14px 16px!important;display:flex!important;align-items:center!important;gap:9px!important;background:#fff!important;}
+body .fvc-cats-grid .fvc-cat-body::before{content:""!important;width:7px!important;height:7px!important;border-radius:50%!important;background:#09BDB8!important;flex:none!important;}
+body .fvc-cats-grid .fvc-cat-name{font-size:15.5px!important;font-weight:600!important;color:#1d1d1f!important;letter-spacing:-.01em!important;}
+</style>
 HTML;
 }
 
