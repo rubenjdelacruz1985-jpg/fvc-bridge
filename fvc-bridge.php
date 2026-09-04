@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.121
+ * Version: 1.16.123
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.121');
+define('FVC_BRIDGE_VERSION',    '1.16.123');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1498,6 +1498,15 @@ body.post-type-archive-gd_place .fvc-card-service-tag ~ .fvc-card-service-tag ~ 
 HTML;
 }
 
+// Sign-up form pages: hide the global fixed "Search clinics" bar. It's a patient-facing
+// search that has no place on a clinic owner's sign-up form and, on mobile, covers the
+// fields and the submit button as they scroll.
+add_action('wp_head', 'fvc_bridge_signup_hide_searchbar', 34);
+function fvc_bridge_signup_hide_searchbar() {
+    if ( ! ( function_exists('is_page') && is_page(array('claim-listing', 'list-your-clinic')) ) ) return;
+    echo '<style id="fvc-signup-nosearch">body #fvc-sb-wrap{display:none !important;}</style>' . "\n";
+}
+
 // Clinic profile (single listing) — dark hero, light body (was fully dark). Keeps the photo hero dark.
 add_action('wp_head', 'fvc_bridge_profile_css', 34);
 function fvc_bridge_profile_css() {
@@ -1925,6 +1934,7 @@ function fvc_bridge_collect_post() {
         'billing'     => sanitize_text_field($_POST['billing'] ?? 'Not answered'),
         'booking'     => sanitize_text_field($_POST['booking'] ?? 'Not answered'),
         'notes'       => sanitize_textarea_field($_POST['notes'] ?? ''),
+        'source_tool' => sanitize_text_field($_POST['source_tool'] ?? ''),
         'consent'     => ! empty($_POST['marketing_consent']),
     );
 }
@@ -1941,7 +1951,7 @@ function fvc_bridge_new_listing_handler() {
         'clinic_name' => $d['clinic_name'], 'website' => $d['website'], 'address' => $d['address'],
         'contact_name' => $d['contact'], 'role' => $d['role'], 'email' => $d['email'], 'phone' => $d['phone'],
         'services' => $d['services'], 'icbc' => $d['icbc'], 'worksafe' => $d['worksafe'], 'billing' => $d['billing'], 'booking' => $d['booking'],
-        'notes' => $d['notes'], 'marketing_consent' => $d['consent'],
+        'notes' => $d['notes'], 'source_tool' => $d['source_tool'], 'marketing_consent' => $d['consent'],
         'matched_post_id' => $match ? $match['post_id'] : null, 'match_score' => $match ? $match['score'] : null,
     ));
 
@@ -1954,6 +1964,7 @@ function fvc_bridge_new_listing_handler() {
         . '<li>Email: ' . esc_html($d['email']) . ' | Phone: ' . esc_html($d['phone']) . '</li>'
         . '<li>Services: ' . esc_html($d['services']) . '</li>'
         . '<li>ICBC/WSBC: ' . esc_html($d['icbc']) . ' / ' . esc_html($d['worksafe']) . ' | Billing/Booking: ' . esc_html($d['billing']) . ' / ' . esc_html($d['booking']) . '</li>'
+        . ($d['source_tool'] ? '<li><strong>Came from tool:</strong> ' . esc_html($d['source_tool']) . '</li>' : '')
         . '<li>Marketing consent: ' . ($d['consent'] ? 'Yes' : 'No') . '</li>'
         . ($match ? '<li><strong>Possible duplicate:</strong> ' . esc_html($match['name']) . ' (score ' . $match['score'] . ') ' . esc_url($match['url']) . '</li>' : '')
         . ($d['notes'] ? '<li>Notes: ' . esc_html($d['notes']) . '</li>' : '') . '</ul>';
@@ -1995,7 +2006,7 @@ function fvc_bridge_claim_handler() {
         'clinic_name' => $d['clinic_name'], 'listing_url' => $d['listing_url'],
         'contact_name' => $d['contact'], 'role' => $d['role'], 'email' => $d['email'], 'phone' => $d['phone'],
         'services' => $d['services'], 'icbc' => $d['icbc'], 'worksafe' => $d['worksafe'], 'billing' => $d['billing'], 'booking' => $d['booking'],
-        'notes' => $d['notes'], 'marketing_consent' => $d['consent'],
+        'notes' => $d['notes'], 'source_tool' => $d['source_tool'], 'marketing_consent' => $d['consent'],
         'matched_post_id' => $match ? $match['post_id'] : null, 'match_score' => $match ? $match['score'] : null,
     ));
 
@@ -2008,6 +2019,7 @@ function fvc_bridge_claim_handler() {
         . '<li>Contact: ' . esc_html($d['contact']) . ' (' . esc_html($d['role']) . ')</li>'
         . '<li>Email: ' . esc_html($d['email']) . ' | Phone: ' . esc_html($d['phone']) . '</li>'
         . '<li>Marketing consent: ' . ($d['consent'] ? 'Yes' : 'No') . '</li>'
+        . ($d['source_tool'] ? '<li><strong>Came from tool:</strong> ' . esc_html($d['source_tool']) . '</li>' : '')
         . ($d['notes'] ? '<li>Notes: ' . esc_html($d['notes']) . '</li>' : '') . '</ul>';
     $sent = wp_mail('claim@findvancouverclinics.com', 'New Claim Request: ' . $d['clinic_name'], $admin, $headers);
 
