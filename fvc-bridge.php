@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.79
+ * Version: 1.16.80
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.79');
+define('FVC_BRIDGE_VERSION',    '1.16.80');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1021,6 +1021,8 @@ function fvc_bridge_header_css() {
 #fvcMobileMenu>a.fvc-mm-cta{order:99!important;margin-top:auto!important;text-align:center!important;background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;border:0!important;border-bottom:0!important;border-radius:4px!important;padding:13px!important;font-weight:600!important;box-shadow:0 8px 20px rgba(9,189,184,.3)!important;}
 /* hamburger -> X when the mobile menu is open */
 #fvcHamburger .fvc-hamburger-bar{transition:transform .25s ease,opacity .2s ease!important;}
+/* keep the icon visible on any backdrop (was blending into the dark header/menu) */
+#fvcHamburger .fvc-hamburger-bar{background:#fff!important;height:2px!important;border-radius:2px!important;box-shadow:0 0 3px rgba(0,0,0,.55),0 1px 1px rgba(0,0,0,.4)!important;}
 body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(1){transform:translateY(7px) rotate(45deg)!important;}
 body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(2){opacity:0!important;}
 body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(3){transform:translateY(-7px) rotate(-45deg)!important;}
