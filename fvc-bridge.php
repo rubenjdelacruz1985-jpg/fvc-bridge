@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.131
+ * Version: 1.16.134
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.131');
+define('FVC_BRIDGE_VERSION',    '1.16.134');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1633,6 +1633,36 @@ add_action('wp_head', 'fvc_bridge_hide_searchbar', 34);
 function fvc_bridge_hide_searchbar() {
     if ( function_exists('is_front_page') && is_front_page() ) return;
     echo '<style id="fvc-hide-searchbar">body #fvc-sb-wrap{display:none !important;}</style>' . "\n";
+}
+
+// Card polish: tighter homepage category/blog cards on mobile (they were quite tall — 9
+// full-width category cards = a very long scroll), and convert the /blog/ archive to the
+// site's light body with clean white cards (it was dark with transparent, hairline-bordered
+// cards — the "line touching the card"). Gated by body classes (.home / .blog).
+add_action('wp_head', 'fvc_bridge_card_polish', 37);
+function fvc_bridge_card_polish() {
+    echo <<<'HTML'
+<style id="fvc-card-polish">
+@media(max-width:768px){
+  body.home .fvc-cats-grid{grid-template-columns:1fr 1fr !important;gap:12px !important;}
+  body.home .fvc-cat-card{height:auto !important;min-height:0 !important;}
+  body.home .fvc-cat-img{flex:0 0 auto !important;height:100px !important;}
+  body.home .fvc-cat-name{font-size:13.5px !important;}
+  body.home .fvc-blog-img{height:130px !important;}
+  body.home .fvc-blog-card img{height:130px !important;object-fit:cover !important;width:100% !important;}
+}
+/* /blog/ archive -> light body + clean white cards (was dark + transparent hairline cards) */
+body.blog .elementor-element-1e583ba4{background:#f4f2ed !important;}
+body.blog .e-loop-item{background:#fff !important;border:1px solid #e7e7ec !important;border-radius:14px !important;overflow:hidden !important;box-shadow:0 6px 20px rgba(20,20,45,.06) !important;}
+/* the loop item's inner Elementor container carries the template's dark fill (rgb(19,20,19)) — clear it so the white card shows */
+body.blog .e-loop-item > .e-con,body.blog .e-loop-item > .e-flex,body.blog .e-loop-item > .elementor-element,body.blog .e-loop-item .e-con-inner{background-color:transparent !important;}
+body.blog .e-loop-item h2,body.blog .e-loop-item h2 a,body.blog .e-loop-item .elementor-heading-title,body.blog .e-loop-item .elementor-heading-title a{color:#1d1d1f !important;}
+body.blog .e-loop-item .elementor-widget-text-editor,body.blog .e-loop-item .elementor-widget-theme-post-excerpt,body.blog .e-loop-item p{color:#5b5b61 !important;}
+body.blog .e-loop-item .elementor-icon-list-text{color:#8a8a90 !important;}
+body.blog .e-loop-item .elementor-post-info__terms-list-item{color:#0a8078 !important;}
+body.blog .e-loop-item img{height:170px !important;object-fit:cover !important;width:100% !important;}
+</style>
+HTML;
 }
 
 // Blog archive (/blog/) filter tabs: All / For patients / For clinics. Client-side show/hide —
