@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.125
+ * Version: 1.16.127
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.125');
+define('FVC_BRIDGE_VERSION',    '1.16.127');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1528,6 +1528,42 @@ add_action('wp_head', 'fvc_bridge_hide_searchbar', 34);
 function fvc_bridge_hide_searchbar() {
     if ( function_exists('is_front_page') && is_front_page() ) return;
     echo '<style id="fvc-hide-searchbar">body #fvc-sb-wrap{display:none !important;}</style>' . "\n";
+}
+
+// Blog archive (/blog/) filter tabs: All / For patients / For clinics. Client-side show/hide —
+// tags each loop card by whether its post is in the "For Clinics" category (43) via the WP REST API.
+add_action('wp_footer', 'fvc_bridge_blog_filter', 60);
+function fvc_bridge_blog_filter() {
+    if ( ! ( function_exists('is_home') && is_home() ) ) return;
+    echo <<<HTML
+<style id="fvc-blogfilter-css">
+.fvc-blogfilter{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin:0 auto 34px;max-width:1200px;padding:0 20px;}
+.fvc-blogfilter button{font-family:'Plus Jakarta Sans',sans-serif;font-size:14px;font-weight:600;color:#4f4f57;background:#fff;border:1px solid #e2e2e7;border-radius:999px;padding:9px 20px;cursor:pointer;transition:border-color .15s,color .15s,background .15s;}
+.fvc-blogfilter button:hover{border-color:#09BDB8;color:#0a8078;}
+.fvc-blogfilter button.active{background:#0a8078;border-color:#0a8078;color:#fff;}
+.fvc-bf-hidden{display:none !important;}
+</style>
+<script>(function(){
+  function init(){
+    var loop=document.querySelector('.elementor-loop-container');
+    if(!loop)return;
+    var cards=Array.prototype.slice.call(loop.querySelectorAll('.e-loop-item'));
+    if(!cards.length)return;
+    cards.forEach(function(card){
+      var isClinic=!!card.querySelector('a[href*="/category/for-clinics"]');
+      card.setAttribute('data-fvcbf',isClinic?'clinics':'patients');
+    });
+    var bar=document.createElement('div');bar.className='fvc-blogfilter';
+    [['all','All'],['patients','For patients'],['clinics','For clinics']].forEach(function(t){var b=document.createElement('button');b.textContent=t[1];b.setAttribute('data-f',t[0]);if(t[0]==='all')b.className='active';bar.appendChild(b);});
+    loop.parentNode.insertBefore(bar,loop);
+    bar.addEventListener('click',function(e){var b=e.target.closest('button');if(!b)return;var f=b.getAttribute('data-f');
+      Array.prototype.forEach.call(bar.querySelectorAll('button'),function(x){x.classList.toggle('active',x===b);});
+      cards.forEach(function(card){var show=(f==='all')||card.getAttribute('data-fvcbf')===f;card.classList.toggle('fvc-bf-hidden',!show);});
+    });
+  }
+  if(document.readyState!=='loading')init();else document.addEventListener('DOMContentLoaded',init);
+})();</script>
+HTML;
 }
 
 // Clinic profile (single listing) — dark hero, light body (was fully dark). Keeps the photo hero dark.
