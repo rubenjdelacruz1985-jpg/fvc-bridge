@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.111
+ * Version: 1.16.112
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.111');
+define('FVC_BRIDGE_VERSION',    '1.16.112');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1310,6 +1310,17 @@ body .fvc-cats-grid .fvc-cat-overlay{display:none!important;}
 body .fvc-cats-grid .fvc-cat-body{position:relative!important;bottom:auto!important;padding:14px 16px!important;display:flex!important;align-items:center!important;gap:9px!important;background:#fff!important;}
 body .fvc-cats-grid .fvc-cat-body::before{content:""!important;width:7px!important;height:7px!important;border-radius:50%!important;background:#09BDB8!important;flex:none!important;}
 body .fvc-cats-grid .fvc-cat-name{font-size:15.5px!important;font-weight:600!important;color:#1d1d1f!important;letter-spacing:-.01em!important;}
+body .fvc-cats-grid .fvc-cat-card,body .fvc-blog-card,body .fvc-blog-body{color:#1d1d1f!important;}
+/* Homepage buttons — retheme black/pink to brand teal */
+body .fvc-cats-view-all,body .fvc-hood-view-all,body .fvc-blog-view-all,body .fvc-icbc-btn-secondary{border-color:#09BDB8!important;color:#0a8078!important;background:transparent!important;transition:background .15s,color .15s,border-color .15s!important;}
+body .fvc-cats-view-all:hover,body .fvc-hood-view-all:hover,body .fvc-blog-view-all:hover,body .fvc-icbc-btn-secondary:hover{background:#09BDB8!important;color:#fff!important;border-color:#09BDB8!important;}
+body .fvc-icbc-btn-primary{background:#09BDB8!important;border-color:#09BDB8!important;color:#fff!important;}
+body .fvc-icbc-btn-primary:hover{background:#0a8078!important;border-color:#0a8078!important;color:#fff!important;}
+body .fvc-cta-btn{background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;border:0!important;}
+body .fvc-cta-btn:hover{filter:brightness(1.05)!important;}
+/* off-brand pink (#CC3366) neighbourhood items -> neutral with teal hover */
+body .fvc-hood-item{border-color:rgba(9,9,11,.16)!important;color:#1d1d1f!important;}
+body .fvc-hood-item:hover{border-color:#09BDB8!important;color:#0a8078!important;}
 </style>
 HTML;
 }
