@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.84
+ * Version: 1.16.85
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.84');
+define('FVC_BRIDGE_VERSION',    '1.16.85');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -223,6 +223,13 @@ add_action('rest_api_init', function () {
     register_rest_route('fvc-bridge/v1', '/stripe-platform-config', array('methods'=>array('GET','POST'),'permission_callback'=>function(){return fvc_bridge_has_valid_token()||current_user_can('manage_options');},'callback'=>'fvc_bridge_rest_stripe_platform_config'));
     register_rest_route('fvc-bridge/v1', '/booking-connect-start', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_connect_start'));
     register_rest_route('fvc-bridge/v1', '/booking-connect-status', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_connect_status'));
+    register_rest_route('fvc-bridge/v1', '/waitlist-join', array('methods'=>'POST','permission_callback'=>'fvc_bridge_require_token_or_public','callback'=>'fvc_bridge_rest_waitlist_join'));
+    register_rest_route('fvc-bridge/v1', '/waitlist-list', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_waitlist_list'));
+    register_rest_route('fvc-bridge/v1', '/booking-repeat', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_repeat'));
+    // charting = PHI: logged-in staff only, never the bridge token
+    register_rest_route('fvc-bridge/v1', '/chart-get', array('methods'=>'GET','permission_callback'=>'is_user_logged_in','callback'=>'fvc_bridge_rest_chart_get'));
+    register_rest_route('fvc-bridge/v1', '/chart-save', array('methods'=>'POST','permission_callback'=>'is_user_logged_in','callback'=>'fvc_bridge_rest_chart_save'));
+    register_rest_route('fvc-bridge/v1', '/chart-lock', array('methods'=>'POST','permission_callback'=>'is_user_logged_in','callback'=>'fvc_bridge_rest_chart_lock'));
     register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
     // Public read: a clinic's listing data, formatted to seed the site builder.
     register_rest_route('fvc-bridge/v1', '/clinic-data', array(
@@ -2148,7 +2155,7 @@ function fvc_bridge_rest_booking_config_save($req) {
         'enabled' => ! empty($b['enabled']),
         'externalUrl' => esc_url_raw($b['externalUrl'] ?? ''),
         'services' => array_values(array_map(function ($s) {
-            return array('name' => sanitize_text_field($s['name'] ?? ''), 'duration' => max(15, (int) ($s['duration'] ?? 45)), 'price' => max(0, (float) ($s['price'] ?? 0)));
+            return array('name' => sanitize_text_field($s['name'] ?? ''), 'duration' => max(15, (int) ($s['duration'] ?? 45)), 'price' => max(0, (float) ($s['price'] ?? 0)), 'capacity' => max(1, (int) ($s['capacity'] ?? 1)));
         }, (array) ($b['services'] ?? array()))),
         'practitioners' => array_values(array_map('sanitize_text_field', (array) ($b['practitioners'] ?? array()))),
         'hours' => (array) ($b['hours'] ?? array()),
@@ -2187,9 +2194,9 @@ function fvc_bridge_rest_booking_slots($req) {
     $pract = sanitize_text_field((string) $req->get_param('practitioner'));
     if ( ! $id || ! $date ) return new WP_REST_Response(array('ok' => false, 'error' => 'listing+date required'), 400);
     $cfg = fvc_bridge_booking_get_config($id);
-    $svcMin = (int) $cfg['slotMinutes'];
+    $svcMin = (int) $cfg['slotMinutes']; $svcCap = 1;
     $svcName = sanitize_text_field((string) $req->get_param('service'));
-    foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svcName ) { $svcMin = (int) $s['duration']; break; } }
+    foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svcName ) { $svcMin = (int) $s['duration']; $svcCap = max(1, (int) ($s['capacity'] ?? 1)); break; } }
     if ( $svcMin < 15 ) $svcMin = 45;
     $tz = new DateTimeZone($cfg['timezone']);
     $day = DateTime::createFromFormat('Y-m-d', $date, $tz);
@@ -2198,7 +2205,7 @@ function fvc_bridge_rest_booking_slots($req) {
     $hours = isset($cfg['hours'][$wk]) ? $cfg['hours'][$wk] : array();
     if ( count($hours) < 2 ) return new WP_REST_Response(array('ok' => true, 'date' => $date, 'slots' => array()), 200);
     global $wpdb; $t = fvc_bridge_booking_table();
-    $booked = $wpdb->get_results($wpdb->prepare("SELECT start_local,end_local,practitioner FROM $t WHERE listing_id=%d AND status!='cancelled' AND (status!='awaiting_payment' OR created_at > (NOW() - INTERVAL 30 MINUTE)) AND DATE(start_local)=%s", $id, $date), ARRAY_A);
+    $booked = $wpdb->get_results($wpdb->prepare("SELECT start_local,end_local,practitioner,service FROM $t WHERE listing_id=%d AND status!='cancelled' AND (status!='awaiting_payment' OR created_at > (NOW() - INTERVAL 30 MINUTE)) AND DATE(start_local)=%s", $id, $date), ARRAY_A);
     $parts = explode(':', $hours[0]); $oh = (int) $parts[0]; $om = (int) ($parts[1] ?? 0);
     $parts = explode(':', $hours[1]); $ch = (int) $parts[0]; $cm = (int) ($parts[1] ?? 0);
     $cur = clone $day; $cur->setTime($oh, $om);
@@ -2214,16 +2221,23 @@ function fvc_bridge_rest_booking_slots($req) {
         $slotEnd = clone $cur; $slotEnd->modify('+' . $svcMin . ' minutes');
         if ( $slotEnd > $endw ) break;
         if ( $cur > $minTime ) {
-            $sT = $cur->getTimestamp(); $eT = $slotEnd->getTimestamp(); $clash = false;
-            foreach ( $booked as $bk ) {
-                if ( $pract && $bk['practitioner'] !== $pract ) continue;
-                $bkS = DateTime::createFromFormat('Y-m-d H:i:s', $bk['start_local'], $tz);
-                $bkE = DateTime::createFromFormat('Y-m-d H:i:s', $bk['end_local'], $tz);
-                if ( ! $bkS || ! $bkE ) continue;
-                $bS = $bkS->getTimestamp() - $buffer * 60; $bE = $bkE->getTimestamp() + $buffer * 60;
-                if ( $sT < $bE && $eT > $bS ) { $clash = true; break; }
+            if ( $svcCap > 1 ) {
+                // class/group: seats left at this exact start for this service
+                $sStr = $cur->format('Y-m-d H:i:s'); $taken = 0;
+                foreach ( $booked as $bk ) { if ( $bk['service'] === $svcName && $bk['start_local'] === $sStr ) $taken++; }
+                if ( $taken < $svcCap ) $slots[] = $cur->format('H:i');
+            } else {
+                $sT = $cur->getTimestamp(); $eT = $slotEnd->getTimestamp(); $clash = false;
+                foreach ( $booked as $bk ) {
+                    if ( $pract && $bk['practitioner'] !== $pract ) continue;
+                    $bkS = DateTime::createFromFormat('Y-m-d H:i:s', $bk['start_local'], $tz);
+                    $bkE = DateTime::createFromFormat('Y-m-d H:i:s', $bk['end_local'], $tz);
+                    if ( ! $bkS || ! $bkE ) continue;
+                    $bS = $bkS->getTimestamp() - $buffer * 60; $bE = $bkE->getTimestamp() + $buffer * 60;
+                    if ( $sT < $bE && $eT > $bS ) { $clash = true; break; }
+                }
+                if ( ! $clash ) $slots[] = $cur->format('H:i');
             }
-            if ( ! $clash ) $slots[] = $cur->format('H:i');
         }
         $cur->modify('+' . $svcMin . ' minutes');
     }
@@ -2368,8 +2382,8 @@ function fvc_bridge_rest_booking_create($req) {
         if ( $ans !== '' ) $intakePairs[] = array('q' => $q['q'], 'a' => $ans);
     }
     $intakeJson = $intakePairs ? wp_json_encode($intakePairs) : '';
-    $dur = (int) $cfg['slotMinutes'];
-    foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svc ) { $dur = (int) $s['duration']; break; } }
+    $dur = (int) $cfg['slotMinutes']; $cap = 1;
+    foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svc ) { $dur = (int) $s['duration']; $cap = max(1, (int) ($s['capacity'] ?? 1)); break; } }
     if ( $dur < 15 ) $dur = 45;
     $tz = new DateTimeZone($cfg['timezone']);
     $start = DateTime::createFromFormat('Y-m-d H:i', $date . ' ' . $time, $tz);
@@ -2379,12 +2393,17 @@ function fvc_bridge_rest_booking_create($req) {
     global $wpdb; $t = fvc_bridge_booking_table();
     $s = $start->format('Y-m-d H:i:s'); $e = $end->format('Y-m-d H:i:s');
     $freshHold = "(status!='awaiting_payment' OR created_at > (NOW() - INTERVAL 30 MINUTE))";
-    if ( $pract ) {
-        $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND $freshHold AND practitioner=%s AND %s<end_local AND %s>start_local", $id, $pract, $s, $e));
+    if ( $cap > 1 ) {
+        $taken = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND service=%s AND start_local=%s AND status!='cancelled' AND $freshHold", $id, $svc, $s));
+        if ( $taken >= $cap ) return new WP_REST_Response(array('ok' => false, 'error' => 'This class is full — please pick another time.'), 409);
     } else {
-        $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND $freshHold AND %s<end_local AND %s>start_local", $id, $s, $e));
+        if ( $pract ) {
+            $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND $freshHold AND practitioner=%s AND %s<end_local AND %s>start_local", $id, $pract, $s, $e));
+        } else {
+            $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND $freshHold AND %s<end_local AND %s>start_local", $id, $s, $e));
+        }
+        if ( $clash > 0 ) return new WP_REST_Response(array('ok' => false, 'error' => 'That time was just taken — please pick another slot.'), 409);
     }
-    if ( $clash > 0 ) return new WP_REST_Response(array('ok' => false, 'error' => 'That time was just taken — please pick another slot.'), 409);
     $key = wp_generate_password(24, false);
     $cfg['clinic'] = html_entity_decode($p->post_title, ENT_QUOTES);
     $amount = fvc_bridge_booking_amount_cents($cfg, $svc);
@@ -2542,6 +2561,7 @@ function fvc_bridge_rest_booking_status($req) {
         }
     }
     if ( $status === 'confirmed' || $status === 'cancelled' ) fvc_bridge_booking_notify_patient($row, $cfg, $status);
+    if ( $status === 'cancelled' ) fvc_bridge_waitlist_notify((int) $row['listing_id'], substr($row['start_local'], 0, 10));
     return new WP_REST_Response(array('ok' => true, 'status' => $status, 'refunded' => $refunded), 200);
 }
 
@@ -2687,6 +2707,174 @@ add_action('init', function () {
 });
 function fvc_bridge_rest_booking_run_reminders($req) {
     return new WP_REST_Response(array('ok' => true, 'sent' => fvc_bridge_booking_send_reminders()), 200);
+}
+
+// ============================================================
+//  Waitlist — patients join when a day is full; notified when a spot opens.
+// ============================================================
+function fvc_bridge_waitlist_table() { global $wpdb; return $wpdb->prefix . 'fvc_waitlist'; }
+function fvc_bridge_waitlist_ensure() {
+    global $wpdb; if ( get_option('fvc_bridge_waitlist_db') === '1' ) return;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta("CREATE TABLE " . fvc_bridge_waitlist_table() . " (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, listing_id BIGINT UNSIGNED NOT NULL,
+        service VARCHAR(160) DEFAULT '', wdate VARCHAR(20) DEFAULT '', name VARCHAR(160) DEFAULT '',
+        email VARCHAR(190) DEFAULT '', phone VARCHAR(60) DEFAULT '', notified_at DATETIME NULL, created_at DATETIME NOT NULL,
+        PRIMARY KEY (id), KEY listing_id (listing_id)
+    ) " . $wpdb->get_charset_collate() . ";");
+    update_option('fvc_bridge_waitlist_db', '1');
+}
+function fvc_bridge_rest_waitlist_join($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
+    $p = $id ? get_post($id) : null;
+    if ( ! $p || $p->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'clinic not found'), 404);
+    if ( empty($b['consent']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'consent required'), 400);
+    $name = sanitize_text_field($b['name'] ?? ''); $email = sanitize_email($b['email'] ?? ''); $phone = sanitize_text_field($b['phone'] ?? '');
+    if ( ! $name || ! is_email($email) ) return new WP_REST_Response(array('ok' => false, 'error' => 'name and email required'), 400);
+    fvc_bridge_waitlist_ensure();
+    global $wpdb; $wpdb->insert(fvc_bridge_waitlist_table(), array(
+        'listing_id' => $id, 'service' => sanitize_text_field($b['service'] ?? ''), 'wdate' => preg_replace('/[^0-9\-]/', '', $b['date'] ?? ''),
+        'name' => $name, 'email' => $email, 'phone' => $phone, 'created_at' => current_time('mysql'),
+    ));
+    return new WP_REST_Response(array('ok' => true), 200);
+}
+function fvc_bridge_rest_waitlist_list($req) {
+    $id = (int) $req->get_param('listing');
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    fvc_bridge_waitlist_ensure();
+    global $wpdb; $t = fvc_bridge_waitlist_table();
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT id,service,wdate,name,email,phone,notified_at,created_at FROM $t WHERE listing_id=%d ORDER BY created_at DESC LIMIT 200", $id), ARRAY_A);
+    return new WP_REST_Response(array('ok' => true, 'waitlist' => $rows ?: array()), 200);
+}
+// notify waitlisted patients that a spot opened on $date (called from cancellation)
+function fvc_bridge_waitlist_notify($listing_id, $date) {
+    if ( get_option('fvc_bridge_waitlist_db') !== '1' ) return;
+    global $wpdb; $t = fvc_bridge_waitlist_table();
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM $t WHERE listing_id=%d AND notified_at IS NULL AND (wdate=%s OR wdate='' OR wdate IS NULL) LIMIT 50", $listing_id, $date), ARRAY_A);
+    if ( ! $rows ) return;
+    $clinic = html_entity_decode(get_the_title($listing_id), ENT_QUOTES);
+    $bookUrl = home_url('/book/?clinic=' . $listing_id);
+    $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>');
+    foreach ( $rows as $r ) {
+        if ( function_exists('fvc_bridge_email_shell') && is_email($r['email']) ) {
+            $inner = '<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#3f3f46;">Good news, ' . esc_html($r['name']) . ' — a spot just opened at <strong>' . esc_html($clinic) . '</strong>' . ($r['wdate'] ? (' around ' . esc_html($r['wdate'])) : '') . '.</p>'
+                . '<p style="margin:0 0 18px;font-size:14px;color:#3f3f46;">Spots go fast — book now:</p>'
+                . '<a href="' . esc_url($bookUrl) . '" style="display:inline-block;background:#0a8f8b;color:#fff;padding:12px 22px;border-radius:999px;text-decoration:none;font-weight:600;">Book now</a>';
+            wp_mail($r['email'], 'A spot opened at ' . $clinic, fvc_bridge_email_shell('A spot just opened.', 'A spot opened up', $inner), $headers);
+        }
+        fvc_bridge_send_sms($r['phone'] ?? '', $clinic . ': a spot just opened' . ($r['wdate'] ? (' on ' . $r['wdate']) : '') . '. Book: ' . $bookUrl);
+        $wpdb->update($t, array('notified_at' => current_time('mysql')), array('id' => (int) $r['id']));
+    }
+}
+
+// ---- Recurring: repeat an appointment weekly/biweekly N times (owner) ----
+function fvc_bridge_rest_booking_repeat($req) {
+    $b = $req->get_json_params(); $aid = (int) ($b['id'] ?? 0);
+    $freq = in_array(($b['freq'] ?? 'weekly'), array('weekly', 'biweekly'), true) ? $b['freq'] : 'weekly';
+    $count = max(1, min(12, (int) ($b['count'] ?? 3)));
+    if ( ! $aid ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
+    if ( ! $row ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    if ( ! fvc_bridge_booking_owns((int) $row['listing_id']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $cfg = fvc_bridge_booking_get_config((int) $row['listing_id']);
+    $tz = new DateTimeZone($cfg['timezone']); $step = $freq === 'biweekly' ? 14 : 7;
+    $created = 0; $skipped = 0; $fh = "(status!='awaiting_payment' OR created_at > (NOW() - INTERVAL 30 MINUTE))";
+    for ( $i = 1; $i <= $count; $i++ ) {
+        $st = DateTime::createFromFormat('Y-m-d H:i:s', $row['start_local'], $tz); $en = DateTime::createFromFormat('Y-m-d H:i:s', $row['end_local'], $tz);
+        if ( ! $st || ! $en ) break;
+        $st->modify('+' . ($step * $i) . ' days'); $en->modify('+' . ($step * $i) . ' days');
+        $s = $st->format('Y-m-d H:i:s'); $e = $en->format('Y-m-d H:i:s');
+        if ( $row['practitioner'] ) {
+            $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND $fh AND practitioner=%s AND %s<end_local AND %s>start_local", (int) $row['listing_id'], $row['practitioner'], $s, $e));
+        } else {
+            $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND status!='cancelled' AND $fh AND %s<end_local AND %s>start_local", (int) $row['listing_id'], $s, $e));
+        }
+        if ( $clash > 0 ) { $skipped++; continue; }
+        $wpdb->insert($t, array(
+            'listing_id' => (int) $row['listing_id'], 'service' => $row['service'], 'practitioner' => $row['practitioner'],
+            'start_local' => $s, 'end_local' => $e, 'name' => $row['name'], 'email' => $row['email'], 'phone' => $row['phone'],
+            'notes' => $row['notes'], 'status' => 'confirmed', 'manage_key' => wp_generate_password(24, false), 'created_at' => current_time('mysql'),
+        ));
+        $created++;
+    }
+    return new WP_REST_Response(array('ok' => true, 'created' => $created, 'skipped' => $skipped), 200);
+}
+
+// ============================================================
+//  Clinical charting (SOAP) — PHI. STAFF-ONLY (logged-in clinic owner), never token, never public.
+//  Never surfaced in the portal, emails, iCal, or reporting. Lock-on-sign -> append-only addenda.
+//  (Built to docs/charting-privacy-plan.md, Phase 1: plain columns on the site DB.)
+// ============================================================
+function fvc_bridge_charts_table() { global $wpdb; return $wpdb->prefix . 'fvc_charts'; }
+function fvc_bridge_charts_ensure() {
+    global $wpdb; if ( get_option('fvc_bridge_charts_db') === '1' ) return;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta("CREATE TABLE " . fvc_bridge_charts_table() . " (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, listing_id BIGINT UNSIGNED NOT NULL, appt_id BIGINT UNSIGNED NOT NULL,
+        author_id BIGINT UNSIGNED DEFAULT 0, subjective TEXT, objective TEXT, assessment TEXT, plan TEXT, addenda LONGTEXT,
+        created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, locked_at DATETIME NULL,
+        PRIMARY KEY (id), KEY appt_id (appt_id), KEY listing_id (listing_id)
+    ) " . $wpdb->get_charset_collate() . ";");
+    update_option('fvc_bridge_charts_db', '1');
+}
+// staff-only: platform admin OR the logged-in owner of this listing. NO bridge token (PHI).
+function fvc_bridge_chart_can($listing_id) {
+    if ( current_user_can('manage_options') ) return true;
+    $uid = get_current_user_id(); if ( ! $uid ) return false;
+    return (int) get_post_field('post_author', $listing_id) === $uid;
+}
+function fvc_bridge_chart_appt($aid) {
+    global $wpdb; return $wpdb->get_row($wpdb->prepare("SELECT id,listing_id,service,practitioner,start_local,name,email,phone,status FROM " . fvc_bridge_booking_table() . " WHERE id=%d", $aid), ARRAY_A);
+}
+function fvc_bridge_rest_chart_get($req) {
+    $aid = (int) $req->get_param('appt'); if ( ! $aid ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    $ap = fvc_bridge_chart_appt($aid); if ( ! $ap ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    if ( ! fvc_bridge_chart_can((int) $ap['listing_id']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    fvc_bridge_charts_ensure();
+    global $wpdb; $t = fvc_bridge_charts_table();
+    $c = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE appt_id=%d", $aid), ARRAY_A);
+    $tz = new DateTimeZone(fvc_bridge_booking_get_config((int) $ap['listing_id'])['timezone']);
+    $st = DateTime::createFromFormat('Y-m-d H:i:s', $ap['start_local'], $tz);
+    return new WP_REST_Response(array('ok' => true, 'appt' => array(
+        'id' => (int) $ap['id'], 'name' => $ap['name'], 'service' => $ap['service'], 'practitioner' => $ap['practitioner'],
+        'when' => $st ? ($st->format('l, F j, Y') . ' at ' . $st->format('g:i a')) : '',
+    ), 'chart' => $c ?: null), 200);
+}
+function fvc_bridge_rest_chart_save($req) {
+    $b = $req->get_json_params(); $aid = (int) ($b['appt'] ?? 0);
+    if ( ! $aid ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    $ap = fvc_bridge_chart_appt($aid); if ( ! $ap ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    if ( ! fvc_bridge_chart_can((int) $ap['listing_id']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    fvc_bridge_charts_ensure();
+    global $wpdb; $t = fvc_bridge_charts_table(); $now = current_time('mysql'); $uid = get_current_user_id();
+    $c = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE appt_id=%d", $aid), ARRAY_A);
+    $clean = function ($k) use ($b) { return sanitize_textarea_field((string) ($b[$k] ?? '')); };
+    if ( $c && $c['locked_at'] ) {
+        // locked: append-only addendum (record integrity)
+        $add = sanitize_textarea_field((string) ($b['addendum'] ?? ''));
+        if ( $add === '' ) return new WP_REST_Response(array('ok' => false, 'error' => 'This note is signed. Add an addendum instead.'), 409);
+        $arr = json_decode($c['addenda'] ?: '[]', true); if ( ! is_array($arr) ) $arr = array();
+        $u = get_userdata($uid); $arr[] = array('by' => $u ? $u->display_name : 'Staff', 'at' => $now, 'text' => $add);
+        $wpdb->update($t, array('addenda' => wp_json_encode($arr), 'updated_at' => $now, 'author_id' => $uid), array('id' => (int) $c['id']));
+        return new WP_REST_Response(array('ok' => true, 'addendum' => true), 200);
+    }
+    $data = array('subjective' => $clean('subjective'), 'objective' => $clean('objective'), 'assessment' => $clean('assessment'), 'plan' => $clean('plan'), 'updated_at' => $now, 'author_id' => $uid);
+    if ( $c ) { $wpdb->update($t, $data, array('id' => (int) $c['id'])); }
+    else { $data['listing_id'] = (int) $ap['listing_id']; $data['appt_id'] = $aid; $data['created_at'] = $now; $wpdb->insert($t, $data); }
+    return new WP_REST_Response(array('ok' => true), 200);
+}
+function fvc_bridge_rest_chart_lock($req) {
+    $b = $req->get_json_params(); $aid = (int) ($b['appt'] ?? 0);
+    if ( ! $aid ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    $ap = fvc_bridge_chart_appt($aid); if ( ! $ap ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    if ( ! fvc_bridge_chart_can((int) $ap['listing_id']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    fvc_bridge_charts_ensure();
+    global $wpdb; $t = fvc_bridge_charts_table();
+    $c = $wpdb->get_row($wpdb->prepare("SELECT id FROM $t WHERE appt_id=%d", $aid), ARRAY_A);
+    if ( ! $c ) return new WP_REST_Response(array('ok' => false, 'error' => 'Save the note first.'), 400);
+    $wpdb->update($t, array('locked_at' => current_time('mysql')), array('id' => (int) $c['id']));
+    return new WP_REST_Response(array('ok' => true, 'locked' => true), 200);
 }
 
 // ============================================================
