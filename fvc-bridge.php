@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.127
+ * Version: 1.16.128
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.127');
+define('FVC_BRIDGE_VERSION',    '1.16.128');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -219,6 +219,9 @@ add_action('rest_api_init', function () {
         'permission_callback' => 'fvc_bridge_has_valid_token',
         'callback'            => 'fvc_bridge_rest_trash_listing',
     ));
+    // Social auto-poster (Meta Graph API): owner sets Page/IG creds; token can trigger a post.
+    register_rest_route('fvc-bridge/v1', '/social-config', array('methods'=>array('GET','POST'),'permission_callback'=>function(){return fvc_bridge_has_valid_token()||current_user_can('manage_options');},'callback'=>'fvc_bridge_rest_social_config'));
+    register_rest_route('fvc-bridge/v1', '/social-post', array('methods'=>'POST','permission_callback'=>'fvc_bridge_has_valid_token','callback'=>'fvc_bridge_rest_social_post'));
     // ---- Booking v1 (native) ----
     register_rest_route('fvc-bridge/v1', '/booking-config', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_config'));
     register_rest_route('fvc-bridge/v1', '/booking-config-save', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_config_save'));
@@ -514,6 +517,84 @@ function fvc_bridge_rest_trash_listing($req) {
     }
     $r = wp_trash_post($id); // reversible
     return new WP_REST_Response(array('ok' => (bool) $r, 'id' => $id, 'name' => $name, 'action' => 'trashed', 'status' => get_post_status($id)), 200);
+}
+
+// ---- Social auto-poster: Facebook Page + Instagram Business via the Meta Graph API ----
+// The Page token / IDs are set by the owner (Ruben) through /social-config — Claude never
+// handles them. Everything no-ops cleanly until a Page token + IDs are in place.
+if ( ! defined('FVC_GRAPH') ) define('FVC_GRAPH', 'https://graph.facebook.com/v21.0/');
+
+// GET: config status (no secrets). POST: save creds (blank keeps existing) + auto flag.
+function fvc_bridge_rest_social_config($req) {
+    if ( $req->get_method() === 'GET' ) {
+        $tok = (bool) get_option('fvc_meta_page_token');
+        return new WP_REST_Response(array(
+            'ok' => true,
+            'fbConfigured' => (bool) ( get_option('fvc_meta_page_id') && $tok ),
+            'igConfigured' => (bool) ( get_option('fvc_meta_ig_id') && $tok ),
+            'auto'         => (bool) get_option('fvc_social_auto'),
+            'redirect'     => admin_url('admin.php'),
+        ), 200);
+    }
+    $p = $req->get_json_params(); if ( ! is_array($p) ) $p = $req->get_params();
+    if ( isset($p['fb_page_id']) )      update_option('fvc_meta_page_id', sanitize_text_field($p['fb_page_id']));
+    if ( ! empty($p['fb_page_token']) ) update_option('fvc_meta_page_token', sanitize_text_field($p['fb_page_token']));
+    if ( isset($p['ig_user_id']) )      update_option('fvc_meta_ig_id', sanitize_text_field($p['ig_user_id']));
+    if ( isset($p['auto']) )            update_option('fvc_social_auto', ! empty($p['auto']) ? 1 : 0);
+    return new WP_REST_Response(array('ok' => true, 'saved' => true), 200);
+}
+
+// Post to the FB Page feed + Instagram (IG requires a public image_url). Returns per-network results.
+function fvc_bridge_social_post($message, $link = '', $image_url = '') {
+    $pageId = get_option('fvc_meta_page_id'); $token = get_option('fvc_meta_page_token'); $igId = get_option('fvc_meta_ig_id');
+    $out = array('fb' => null, 'ig' => null);
+    if ( $pageId && $token ) {
+        $body = array('message' => $message, 'access_token' => $token);
+        if ( $link ) $body['link'] = $link;
+        $r = wp_remote_post(FVC_GRAPH . $pageId . '/feed', array('timeout' => 20, 'body' => $body));
+        $out['fb'] = is_wp_error($r) ? array('error' => $r->get_error_message()) : json_decode(wp_remote_retrieve_body($r), true);
+    }
+    if ( $igId && $token && $image_url ) {
+        $c = wp_remote_post(FVC_GRAPH . $igId . '/media', array('timeout' => 25, 'body' => array('image_url' => $image_url, 'caption' => $message . ($link ? "\n\n" . $link : ''), 'access_token' => $token)));
+        $cj = is_wp_error($c) ? null : json_decode(wp_remote_retrieve_body($c), true);
+        if ( ! empty($cj['id']) ) {
+            $pub = wp_remote_post(FVC_GRAPH . $igId . '/media_publish', array('timeout' => 25, 'body' => array('creation_id' => $cj['id'], 'access_token' => $token)));
+            $out['ig'] = is_wp_error($pub) ? array('error' => $pub->get_error_message()) : json_decode(wp_remote_retrieve_body($pub), true);
+        } else {
+            $out['ig'] = is_wp_error($c) ? array('error' => $c->get_error_message()) : $cj;
+        }
+    }
+    return $out;
+}
+
+// REST: trigger a post (manual / test / scheduled). {message, link?, image_url?}
+function fvc_bridge_rest_social_post($req) {
+    $p = $req->get_json_params(); if ( ! is_array($p) ) $p = $req->get_params();
+    $msg = sanitize_textarea_field($p['message'] ?? '');
+    if ( ! $msg ) return new WP_REST_Response(array('ok' => false, 'error' => 'message required'), 400);
+    if ( ! get_option('fvc_meta_page_token') ) return new WP_REST_Response(array('ok' => false, 'error' => 'not_configured', 'message' => 'Set the Meta Page token via /social-config first.'), 200);
+    $res = fvc_bridge_social_post($msg, esc_url_raw($p['link'] ?? ''), esc_url_raw($p['image_url'] ?? ''));
+    return new WP_REST_Response(array('ok' => true, 'result' => $res), 200);
+}
+
+// Auto-post a newly published blog post (once), if enabled + configured. Deferred via cron so it
+// never blocks the publish request.
+add_action('transition_post_status', 'fvc_bridge_social_autopost', 10, 3);
+function fvc_bridge_social_autopost($new, $old, $post) {
+    if ( $new !== 'publish' || $old === 'publish' ) return;      // first publish only
+    if ( ! isset($post->post_type) || $post->post_type !== 'post' ) return;
+    if ( ! get_option('fvc_social_auto') || ! get_option('fvc_meta_page_token') ) return;
+    if ( get_post_meta($post->ID, '_fvc_social_done', true) ) return;
+    wp_schedule_single_event(time() + 30, 'fvc_social_post_event', array($post->ID));
+}
+add_action('fvc_social_post_event', 'fvc_bridge_do_autopost', 10, 1);
+function fvc_bridge_do_autopost($post_id) {
+    $post = get_post($post_id);
+    if ( ! $post || get_post_meta($post_id, '_fvc_social_done', true) ) return;
+    $img = get_the_post_thumbnail_url($post_id, 'large') ?: '';
+    $excerpt = wp_strip_all_tags(get_the_excerpt($post));
+    fvc_bridge_social_post($post->post_title . ($excerpt ? "\n\n" . $excerpt : ''), get_permalink($post_id), $img);
+    update_post_meta($post_id, '_fvc_social_done', 1);
 }
 
 // Take a clinic's site offline (draft) — same ownership rules as clinic-publish.
