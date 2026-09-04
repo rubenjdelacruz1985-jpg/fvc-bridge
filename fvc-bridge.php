@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.108
+ * Version: 1.16.109
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.108');
+define('FVC_BRIDGE_VERSION',    '1.16.109');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1184,30 +1184,30 @@ function fvc_bridge_render_filter($atts = array()) {
 // breadcrumb) for every category. This makes it reflect the actual category + real category count.
 function fvc_bridge_category_hero_copy() {
     return array(
-        'physiotherapy-vancouver' => array('Physiotherapy', 'Compare physiotherapy clinics across Vancouver — ICBC direct billing, Google ratings and easy online booking.'),
-        'chiropractor-vancouver'  => array('Chiropractors', 'Compare chiropractors across Vancouver by Google rating, neighbourhood, ICBC billing and online booking.'),
-        'massage-therapy-vancouver' => array('Massage Therapy', 'Find registered massage therapists (RMT) across Vancouver — direct billing, ratings and online booking.'),
-        'naturopath-vancouver'    => array('Naturopaths', 'Compare naturopathic doctors across Vancouver by focus, Google rating and neighbourhood.'),
-        'acupuncture-vancouver'   => array('Acupuncture', 'Find acupuncturists and TCM clinics across Vancouver by rating, neighbourhood and billing options.'),
-        'counselling-vancouver'   => array('Counselling & Therapy', 'Compare registered clinical counsellors, therapists and psychologists across Vancouver by approach, rating and neighbourhood.'),
-        'kinesiology-vancouver'   => array('Kinesiology', 'Find kinesiologists and active-rehab clinics across Vancouver for injury recovery, ICBC active rehab and return to sport.'),
-        'podiatry-vancouver'      => array('Podiatry', 'Find podiatrists and foot-care clinics across Vancouver for heel pain, orthotics, sports injuries and diabetic foot care.'),
-        'dietitian-vancouver'     => array('Dietitians', 'Compare registered dietitians and nutrition clinics across Vancouver for gut health, diabetes, weight and sports nutrition.'),
+        'physiotherapy-vancouver' => array('Physiotherapy', 'Compare Vancouver physiotherapy clinics by rating, neighbourhood and ICBC billing.'),
+        'chiropractor-vancouver'  => array('Chiropractors', 'Compare Vancouver chiropractors by rating, neighbourhood and billing.'),
+        'massage-therapy-vancouver' => array('Massage Therapy', 'Registered massage therapists (RMT) across Vancouver, by rating and area.'),
+        'naturopath-vancouver'    => array('Naturopaths', 'Compare Vancouver naturopathic doctors by focus, rating and neighbourhood.'),
+        'acupuncture-vancouver'   => array('Acupuncture', 'Vancouver acupuncture & TCM clinics, by rating, area and billing.'),
+        'counselling-vancouver'   => array('Counselling & Therapy', 'Vancouver counsellors, therapists and psychologists, by focus and area.'),
+        'kinesiology-vancouver'   => array('Kinesiology', 'Vancouver kinesiologists & active-rehab clinics for injury recovery and ICBC rehab.'),
+        'podiatry-vancouver'      => array('Podiatry', 'Vancouver podiatrists & foot clinics — heel pain, orthotics and more.'),
+        'dietitian-vancouver'     => array('Dietitians', 'Compare Vancouver dietitians & nutrition clinics by focus and area.'),
     );
 }
 // Best guide (blog post) per category — links the archive to its guide to form a topic cluster
 // (the guides link out to the archives; this links the archives back, so neither is orphaned).
 function fvc_bridge_category_guide() {
     return array(
-        'physiotherapy-vancouver'   => array('physiotherapy-cost-vancouver', 'What physiotherapy costs in Vancouver'),
-        'chiropractor-vancouver'    => array('chiropractor-vancouver-care-and-cost', 'Chiropractic care & costs, explained'),
-        'massage-therapy-vancouver' => array('massage-therapy-stress-tension-headaches', 'Massage for stress, tension & headaches'),
+        'physiotherapy-vancouver'   => array('physiotherapy-cost-vancouver', 'What physiotherapy costs'),
+        'chiropractor-vancouver'    => array('chiropractor-vancouver-care-and-cost', 'Chiropractic care & costs'),
+        'massage-therapy-vancouver' => array('massage-therapy-stress-tension-headaches', 'Massage for stress & headaches'),
         'naturopath-vancouver'      => array('naturopath-vancouver-what-to-expect', 'What a naturopath treats'),
         'acupuncture-vancouver'     => array('acupuncture-vancouver-what-it-helps', 'What acupuncture helps with'),
         'counselling-vancouver'     => array('how-to-find-a-counsellor-therapist-vancouver', 'How to find the right counsellor'),
-        'kinesiology-vancouver'     => array('kinesiology-active-rehab-vancouver', 'Kinesiology & active rehab, explained'),
+        'kinesiology-vancouver'     => array('kinesiology-active-rehab-vancouver', 'Kinesiology & active rehab'),
         'podiatry-vancouver'        => array('podiatrist-vancouver-foot-pain', 'When to see a podiatrist'),
-        'dietitian-vancouver'       => array('registered-dietitian-vancouver', 'Seeing a dietitian: what to expect'),
+        'dietitian-vancouver'       => array('registered-dietitian-vancouver', 'What a dietitian does'),
     );
 }
 add_action('wp_footer', 'fvc_bridge_archive_hero', 96);
@@ -1246,10 +1246,10 @@ function fvc_bridge_archive_hero() {
     echo '<script>window.FVC_ARCHIVE=' . wp_json_encode($data) . ';</script>' . "\n";
     echo <<<'HTML'
 <style>
-body .fvc-cat-stats{display:flex!important;flex-wrap:wrap!important;gap:14px 26px!important;margin-top:20px!important;}
-body .fvc-cat-stats span{font-size:13.5px!important;color:rgba(255,255,255,.72)!important;}
-body .fvc-cat-stats b{display:inline-block!important;color:#2fd4cf!important;font-weight:700!important;font-size:19px!important;margin-right:5px!important;}
-body .fvc-hero-guide{display:inline-flex!important;align-items:center!important;gap:6px!important;margin-top:16px!important;color:#2fd4cf!important;font-weight:600!important;font-size:14.5px!important;text-decoration:none!important;transition:gap .14s,color .14s!important;}
+body .fvc-cat-stats{display:flex!important;flex-wrap:wrap!important;gap:6px 18px!important;margin-top:16px!important;}
+body .fvc-cat-stats span{font-size:13.5px!important;color:rgba(255,255,255,.66)!important;}
+body .fvc-cat-stats b{color:#fff!important;font-weight:700!important;font-size:14.5px!important;margin-right:4px!important;}
+body .fvc-hero-guide{display:inline-flex!important;align-items:center!important;gap:6px!important;margin-top:14px!important;color:rgba(47,212,207,.9)!important;font-weight:600!important;font-size:13px!important;text-decoration:none!important;transition:gap .14s,color .14s!important;}
 body .fvc-hero-guide:hover{color:#4fe8e3!important;gap:10px!important;}
 </style>
 <script>(function(){
@@ -1284,7 +1284,7 @@ body .fvc-hero-guide:hover{color:#4fe8e3!important;gap:10px!important;}
       // topic-cluster link: archive -> its guide (once), after the stats
       if(A.guide&&d&&!document.querySelector('.fvc-hero-guide')){
         var g=document.createElement('a'); g.className='fvc-hero-guide'; g.href=A.guide.url;
-        g.innerHTML='New here? '+esc(A.guide.label)+' <span aria-hidden="true">&rarr;</span>';
+        g.innerHTML='<span style="opacity:.6;font-weight:500">Guide:</span> '+esc(A.guide.label)+' <span aria-hidden="true">&rarr;</span>';
         var afterEl=document.querySelector('.fvc-cat-stats')||d;
         afterEl.parentNode.insertBefore(g, afterEl.nextSibling);
       }
