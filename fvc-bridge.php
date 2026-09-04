@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.58
+ * Version: 1.16.79
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.58');
+define('FVC_BRIDGE_VERSION',    '1.16.79');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -138,6 +138,18 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => 'fvc_bridge_require_token',
         'callback'            => 'fvc_bridge_rest_create_listing',
+    ));
+    // Token-gated: read a page's Elementor data (to inspect/edit page content natively).
+    register_rest_route('fvc-bridge/v1', '/page-elementor', array(
+        'methods'             => 'GET',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_page_elementor_get',
+    ));
+    // Token-gated: write a page's Elementor data back (native page-content editing).
+    register_rest_route('fvc-bridge/v1', '/page-elementor-save', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_require_token',
+        'callback'            => 'fvc_bridge_rest_page_elementor_save',
     ));
     // Token-gated: send the "your listing is now live" email for a published listing.
     register_rest_route('fvc-bridge/v1', '/notify-live', array(
@@ -446,7 +458,103 @@ body .fvc-cf-widget-section.fvc-cf-widget-section{background:radial-gradient(100
 .fvc-cf-widget-section .fvc-iw-rating{color:#f5b60a !important;}
 .fvc-cf-widget-section .fvc-iw-rating-count{color:rgba(255,255,255,.5) !important;}
 </style>
+<script>(function(){
+  function inFinder(el){return el && el.closest && el.closest('.fvc-cf-widget-section');}
+  // (1) Focusing a finder field triggers the browser's native focus-scroll (~430px jump).
+  //     Force preventScroll on programmatic focus of finder fields; pin the scroll on
+  //     pointer-down to also cover native click-focus.
+  try{
+    var _focus = HTMLElement.prototype.focus;
+    HTMLElement.prototype.focus = function(opts){
+      try{ if(this && this.closest && this.closest('.fvc-cf-widget-section')){ var o={preventScroll:true}; for(var k in (opts||{})) o[k]=opts[k]; o.preventScroll=true; return _focus.call(this,o); } }catch(_e){}
+      return _focus.apply(this, arguments);
+    };
+  }catch(_e){}
+  function pinScroll(){
+    var y = window.pageYOffset, done = false;
+    var iv = setInterval(function(){
+      if(done) return;
+      if(Math.abs(window.pageYOffset - y) > 80){ window.scrollTo(0, y); done = true; clearInterval(iv); }
+    }, 20);
+    setTimeout(function(){ done = true; clearInterval(iv); }, 600);
+  }
+  // Desktop: on mouse-down of a finder input, stop the native focus-scroll and refocus without it.
+  document.addEventListener('mousedown', function(e){
+    var t = e.target;
+    if(!inFinder(t)) return;
+    if(t.matches && t.matches('input,textarea')){ e.preventDefault(); try{ t.focus({preventScroll:true}); }catch(_e){ t.focus(); } }
+    else { pinScroll(); }
+  }, true);
+  // Touch (mobile): can't preventDefault focus without breaking it — pin the scroll instead.
+  document.addEventListener('touchstart', function(e){ if(inFinder(e.target)) pinScroll(); }, {capture:true, passive:true});
+  // (2) After "Find my clinic", bring the results into view (they were rendering far below the form).
+  document.addEventListener('click', function(e){
+    var btn = e.target.closest && e.target.closest('.fvc-cf-submit');
+    if(!btn) return;
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      var card = document.querySelector('.fvc-cf-widget-section .fvc-iw-clinic-card');
+      if(card){
+        clearInterval(iv);
+        var top = card.getBoundingClientRect().top + window.pageYOffset - 96;
+        if(top < window.pageYOffset - 40 || top > window.pageYOffset + 40) window.scrollTo({top: top, behavior: 'smooth'});
+      } else if(tries > 25){ clearInterval(iv); }
+    }, 200);
+  }, true);
+})();</script>
 CSS;
+}
+
+// Read a page's Elementor data by slug — lets the bridge inspect/edit native page content.
+function fvc_bridge_rest_page_elementor_get($req) {
+    $slug = sanitize_title($req->get_param('slug'));
+    $p = $slug ? get_page_by_path($slug, OBJECT, 'page') : null;
+    if (!$p) return new WP_REST_Response(array('ok'=>false,'error'=>'page not found'), 404);
+    $data = get_post_meta($p->ID, '_elementor_data', true);
+    return new WP_REST_Response(array(
+        'ok'        => true,
+        'post_id'   => $p->ID,
+        'edit_mode' => get_post_meta($p->ID, '_elementor_edit_mode', true),
+        'length'    => is_string($data) ? strlen($data) : 0,
+        'data'      => $data,
+    ), 200);
+}
+
+// Write a page's Elementor data back. _elementor_data is stored SLASHED (Elementor convention);
+// update_metadata unslashes, so pass wp_slash($json). Then bust Elementor's cached CSS.
+function fvc_bridge_rest_page_elementor_save($req) {
+    $slug = sanitize_title($req->get_param('slug'));
+    $p = $slug ? get_page_by_path($slug, OBJECT, 'page') : null;
+    if (!$p) return new WP_REST_Response(array('ok'=>false,'error'=>'page not found'), 404);
+    // Data is sent base64-encoded so REST/WP slash handling can't mangle the JSON in transit.
+    $b64 = $req->get_param('data_b64');
+    if (!is_string($b64) || $b64 === '') return new WP_REST_Response(array('ok'=>false,'error'=>'no data_b64'), 400);
+    $data = base64_decode($b64, true);
+    if ($data === false || $data === '') return new WP_REST_Response(array('ok'=>false,'error'=>'bad base64'), 400);
+    $decoded = json_decode($data, true);
+    if (!is_array($decoded)) return new WP_REST_Response(array('ok'=>false,'error'=>'invalid json: '.json_last_error_msg()), 400);
+    if (!class_exists('\\Elementor\\Plugin')) return new WP_REST_Response(array('ok'=>false,'error'=>'elementor not active'), 500);
+    $doc = \Elementor\Plugin::$instance->documents->get($p->ID);
+    if (!$doc) return new WP_REST_Response(array('ok'=>false,'error'=>'no elementor document'), 500);
+    // Token requests have no user, so Elementor's save is blocked by capability checks and the
+    // meta sanitizer strips <script>/onclick (no unfiltered_html). Run the save as an admin.
+    $prev = get_current_user_id();
+    $admins = get_users(array('role'=>'administrator','number'=>1,'fields'=>'ID'));
+    if (!empty($admins)) wp_set_current_user((int)$admins[0]);
+    kses_remove_filters();
+    $doc->save(array('elements' => $decoded));
+    kses_init_filters();
+    wp_set_current_user($prev);
+    $back = get_post_meta($p->ID, '_elementor_data', true);
+    $backDecoded = json_decode($back, true);
+    return new WP_REST_Response(array(
+        'ok'               => true,
+        'post_id'          => $p->ID,
+        'storedBytes'      => is_string($back) ? strlen($back) : 0,
+        'semanticIdentical'=> ($backDecoded == $decoded),
+        'scriptsPreserved' => (is_string($back) && strpos($back, 'toggleFaq') !== false),
+    ), 200);
 }
 
 /* ---- IndexNow: push new/updated URLs to search engines (Bing, Yandex, etc.) ---- */
@@ -925,12 +1033,12 @@ body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(3){tran
 #fvcMobileMenu .fvc-mm-ai-t{display:block!important;font-size:15px!important;font-weight:700!important;color:#fff!important;}
 #fvcMobileMenu .fvc-mm-ai-d{display:block!important;font-size:12px!important;font-weight:400!important;color:rgba(255,255,255,.6)!important;margin-top:2px!important;}
 /* locked type scale: section headings identical across the home page */
-.fvc-cats-section h2.fvc-cats-h2,.fvc-cta-section h2.fvc-cta-h2{font-size:clamp(28px,4.5vw,42px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
+.fvc-cats-section h2.fvc-cats-h2,.fvc-cta-section h2.fvc-cta-h2,.fvc-cta-strip .fvc-cta-strip-inner h2,body .fvc-section-h2{font-size:clamp(28px,4.5vw,42px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
 /* heading WEIGHT consistency: site headings are 500 (single-listing 400, claim-CTA 700, blog 400) */
 body .fvc-cta-wrap h2{font-weight:500!important;letter-spacing:-.03em!important;}
 body.single-post h1,body.single-post h2{font-weight:500!important;}
 /* unify inner-page hero title SIZE to one scale (home hero stays large; blog keeps its own size) */
-body:not(.home) .fvc-hero-h1,.fvc-cf-h1,body .fvc-sl-title{font-size:clamp(28px,4vw,48px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
+body:not(.home) .fvc-hero-h1,.fvc-cf-h1,body .fvc-sl-title,body:not(.home) .fvc-hero h1{font-size:clamp(28px,4vw,48px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
 /* remove the hero secondary "List your clinic free" button */
 body .fvc-hero-btn-secondary{display:none!important;}
 /* lock inner-page action buttons to the site's 4px rounded-rect (archive/search/single) */
@@ -945,6 +1053,17 @@ body #fvc-sb-wrap,html #fvc-sb-wrap{left:0!important;right:0!important;bottom:0!
 #fvc-sb-wrap #fvc-sb-submit,#fvc-sb-inner #fvc-sb-submit{background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;background-color:#0a9b96!important;color:#fff!important;border:0!important;border-radius:4px!important;box-shadow:0 6px 16px rgba(9,189,184,.3)!important;}
 @media(max-width:768px){body #fvc-sb-wrap,html #fvc-sb-wrap{padding-left:12px!important;padding-right:12px!important;box-shadow:0 -10px 30px rgba(0,0,0,.5)!important;}}
 body:has(#fvcMobileMenu.open) #fvc-sb-wrap{display:none!important;}
+/* --- accessibility: raise low-contrast text toward WCAG AA --- */
+body .fvc-hero-breadcrumb,body .fvc-hero-breadcrumb *{color:rgba(255,255,255,.68)!important;}
+body .fvc-hero-sub{color:rgba(255,255,255,.66)!important;}
+body .fvc-trust-text{color:rgba(255,255,255,.62)!important;}
+body .fvc-cats-sub,body .fvc-hood-sub{color:rgba(9,9,11,.66)!important;}
+.fvc-card-meta,.fvc-card-meta-item,.fvc-card-row,.fvc-card-service-tag{color:#4f4f57!important;}
+.fvc-card-rating-count{color:rgba(0,0,0,.6)!important;}
+body .fvc-filter-title{color:rgba(255,255,255,.62)!important;}
+.fvc-area-pill{color:rgba(255,255,255,.85)!important;}
+/* larger touch targets on mobile (>=44px); View Clinic compact (not full-width) on mobile */
+@media(max-width:768px){#fvcNavWrap .fvc-cta{min-height:44px!important;display:inline-flex!important;align-items:center!important;}#fvc-sb-wrap .fvc-sb-btn-toggle,#fvc-sb-wrap #fvc-sb-input,#fvc-sb-wrap #fvc-sb-submit{min-height:44px!important;}.fvc-card-btn{width:auto!important;align-self:flex-start!important;}}
 </style>
 <script>(function(){
   var DESC={'physiotherapy':'Injury, pain & recovery','chiropractic':'Alignment & manual therapy','massage therapy':'Therapeutic & relaxation','naturopath':'Natural, whole-body care','acupuncture':'Traditional pain & wellness'};
