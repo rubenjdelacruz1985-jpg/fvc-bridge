@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.86
+ * Version: 1.16.87
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.86');
+define('FVC_BRIDGE_VERSION',    '1.16.87');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -233,6 +233,9 @@ add_action('rest_api_init', function () {
     register_rest_route('fvc-bridge/v1', '/credit-check', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_credit_check'));
     register_rest_route('fvc-bridge/v1', '/giftcard-buy', array('methods'=>'POST','permission_callback'=>'fvc_bridge_require_token_or_public','callback'=>'fvc_bridge_rest_giftcard_buy'));
     register_rest_route('fvc-bridge/v1', '/giftcard-verify', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_giftcard_verify'));
+    register_rest_route('fvc-bridge/v1', '/sms-balance', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_sms_balance'));
+    register_rest_route('fvc-bridge/v1', '/sms-load', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_sms_load'));
+    register_rest_route('fvc-bridge/v1', '/sms-verify', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_sms_verify'));
     register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
     // Public read: a clinic's listing data, formatted to seed the site builder.
     register_rest_route('fvc-bridge/v1', '/clinic-data', array(
@@ -2057,7 +2060,7 @@ function fvc_bridge_booking_defaults($listing_id) {
         // scheduling policy
         'minNoticeHours' => 2, 'bufferMinutes' => 0, 'maxAdvanceDays' => 60, 'cancelWindowHours' => 24,
         // payments (per-clinic Stripe; secret key stored separately in _fvc_booking_sk)
-        'pay' => array('mode' => 'off', 'depositType' => 'fixed', 'depositAmount' => 0, 'currency' => 'cad', 'pk' => ''),
+        'pay' => array('provider' => 'stripe', 'mode' => 'off', 'depositType' => 'fixed', 'depositAmount' => 0, 'currency' => 'cad', 'pk' => ''),
         'reminders' => true,
         'intake' => array(), // custom questions: [{q, type:'text'|'textarea', required:bool}]
         'giftcardsOn' => false,
@@ -2108,18 +2111,24 @@ function fvc_bridge_rest_booking_config_admin($req) {
     if ( isset($cfg['pay']['sk']) ) unset($cfg['pay']['sk']);
     $cfg['ok'] = true; $cfg['listingId'] = $id; $cfg['hasSecret'] = fvc_bridge_booking_secret($id) !== '';
     $cfg['connect'] = array('platformOn' => fvc_bridge_stripe_platform_sk() !== '', 'acct' => fvc_bridge_stripe_connect_acct($id), 'feePct' => fvc_bridge_stripe_platform_fee_pct());
+    $cfg['sms'] = array('balanceCents' => fvc_bridge_sms_balance($id), 'costCents' => fvc_bridge_sms_cost_cents(), 'on' => (bool) ( get_option('fvc_twilio_sid') && get_option('fvc_twilio_from') ));
     return new WP_REST_Response($cfg, 200);
 }
 
 // ---- Stripe Connect onboarding (Express accounts + Account Links) ----
 function fvc_bridge_rest_stripe_platform_config($req) {
-    if ( $req->get_method() === 'GET' ) {
-        return new WP_REST_Response(array('ok' => true, 'configured' => fvc_bridge_stripe_platform_sk() !== '', 'feePct' => fvc_bridge_stripe_platform_fee_pct()), 200);
-    }
+    $out = function () { return array('ok' => true, 'configured' => fvc_bridge_stripe_platform_sk() !== '', 'feePct' => fvc_bridge_stripe_platform_fee_pct(),
+        'twilioOn' => (bool) ( get_option('fvc_twilio_sid') && get_option('fvc_twilio_from') ), 'smsCostCents' => fvc_bridge_sms_cost_cents(), 'twilioFrom' => get_option('fvc_twilio_from', '')); };
+    if ( $req->get_method() === 'GET' ) return new WP_REST_Response($out(), 200);
     $b = $req->get_json_params();
     if ( isset($b['sk']) ) { $sk = trim((string) $b['sk']); if ( $sk === '__clear__' ) delete_option('fvc_stripe_platform_sk'); elseif ( $sk !== '' && strpos($sk, '••') === false ) update_option('fvc_stripe_platform_sk', $sk); }
     if ( isset($b['feePct']) ) update_option('fvc_stripe_platform_fee_pct', max(0, min(100, (float) $b['feePct'])));
-    return new WP_REST_Response(array('ok' => true, 'configured' => fvc_bridge_stripe_platform_sk() !== '', 'feePct' => fvc_bridge_stripe_platform_fee_pct()), 200);
+    // platform Twilio (funds SMS for all clinics; billed to their prepaid credit)
+    if ( isset($b['twilio_sid']) ) update_option('fvc_twilio_sid', sanitize_text_field($b['twilio_sid']));
+    if ( isset($b['twilio_token']) ) { $tk = trim((string) $b['twilio_token']); if ( $tk === '__clear__' ) delete_option('fvc_twilio_token'); elseif ( $tk !== '' && strpos($tk, '••') === false ) update_option('fvc_twilio_token', $tk); }
+    if ( isset($b['twilio_from']) ) update_option('fvc_twilio_from', sanitize_text_field($b['twilio_from']));
+    if ( isset($b['sms_cost']) ) update_option('fvc_sms_cost_cents', max(0, (int) $b['sms_cost']));
+    return new WP_REST_Response($out(), 200);
 }
 function fvc_bridge_rest_booking_connect_start($req) {
     $id = (int) $req->get_param('listing');
@@ -2178,6 +2187,7 @@ function fvc_bridge_rest_booking_config_save($req) {
             return $qt === '' ? null : array('q' => $qt, 'type' => in_array(($q['type'] ?? 'text'), array('text','textarea'), true) ? $q['type'] : 'text', 'required' => ! empty($q['required']));
         }, (array) ($b['intake'] ?? array())))),
         'pay' => array(
+            'provider' => in_array(($payIn['provider'] ?? 'stripe'), array('stripe'), true) ? $payIn['provider'] : 'stripe',
             'mode' => $mode,
             'depositType' => in_array(($payIn['depositType'] ?? 'fixed'), array('fixed','percent'), true) ? $payIn['depositType'] : 'fixed',
             'depositAmount' => max(0, (float) ($payIn['depositAmount'] ?? 0)),
@@ -2303,17 +2313,24 @@ function fvc_bridge_booking_pay_creds($listing_id) {
 }
 function fvc_bridge_money($cents, $cur) { return '$' . number_format(((int) $cents) / 100, 2) . ' ' . strtoupper($cur); }
 
-// ---- SMS (optional Twilio; silent no-op unless configured in wp-admin options) ----
-function fvc_bridge_send_sms($to, $msg) {
+// ---- SMS (platform Twilio; billed to a clinic's prepaid SMS credit) ----
+function fvc_bridge_sms_cost_cents() { return max(0, (int) get_option('fvc_sms_cost_cents', 10)); } // charged to the clinic per text
+function fvc_bridge_sms_balance($listing_id) { return (int) get_post_meta($listing_id, '_fvc_sms_balance_cents', true); }
+function fvc_bridge_send_sms($to, $msg, $listing_id = 0) {
     $sid = get_option('fvc_twilio_sid'); $tok = get_option('fvc_twilio_token'); $from = get_option('fvc_twilio_from');
     $to = preg_replace('/[^0-9+]/', '', (string) $to);
     if ( ! $sid || ! $tok || ! $from || ! $to ) return false;
+    $cost = fvc_bridge_sms_cost_cents();
+    // when a clinic + a per-text cost are set, require prepaid SMS credit
+    if ( $listing_id && $cost > 0 && fvc_bridge_sms_balance($listing_id) < $cost ) return false;
     if ( $to[0] !== '+' ) $to = (strlen($to) === 10 ? '+1' : '+') . $to;
     $res = wp_remote_post('https://api.twilio.com/2010-04-01/Accounts/' . rawurlencode($sid) . '/Messages.json', array(
         'timeout' => 20, 'headers' => array('Authorization' => 'Basic ' . base64_encode($sid . ':' . $tok)),
         'body' => array('To' => $to, 'From' => $from, 'Body' => $msg),
     ));
-    return ! is_wp_error($res) && wp_remote_retrieve_response_code($res) < 300;
+    $ok = ! is_wp_error($res) && wp_remote_retrieve_response_code($res) < 300;
+    if ( $ok && $listing_id && $cost > 0 ) update_post_meta($listing_id, '_fvc_sms_balance_cents', max(0, fvc_bridge_sms_balance($listing_id) - $cost));
+    return $ok;
 }
 
 // ---- send "booking received" (patient) + "new booking" (clinic) emails; reused by no-pay + paid paths ----
@@ -2340,7 +2357,7 @@ function fvc_bridge_booking_emails_new($appt, $cfg, $manageUrl) {
             . '<div style="background:#f7f7f7;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;">' . esc_html($appt['name']) . ' &middot; ' . esc_html($appt['email']) . ( ! empty($appt['phone']) ? ' &middot; ' . esc_html($appt['phone']) : '') . '<br>' . esc_html($svc) . ($pract ? ' with ' . esc_html($pract) : '') . '<br>' . esc_html($when) . ( ! empty($appt['notes']) ? '<br><em>' . esc_html($appt['notes']) . '</em>' : '') . $intakeHtml . '</div>' . $paidNote;
         wp_mail($clinicEmail, 'New booking request — ' . $appt['name'], fvc_bridge_email_shell('New booking request.', 'New booking request', $ci), $headers);
     }
-    fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': appointment request received for ' . $when . '. We\'ll confirm shortly.');
+    fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': appointment request received for ' . $when . '. We\'ll confirm shortly.', (int) ($appt['listing_id'] ?? 0));
 }
 
 // ---- notify patient on confirm / cancel ----
@@ -2355,17 +2372,17 @@ function fvc_bridge_booking_notify_patient($appt, $cfg, $kind) {
         $inner = '<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#3f3f46;">Good news, ' . esc_html($appt['name']) . ' — your appointment is confirmed.</p>'
             . '<div style="background:#f7f7f7;border-left:3px solid #09BDB8;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;"><strong>' . esc_html($clinic) . '</strong><br>' . esc_html($svc) . '<br>' . esc_html($when) . '</div>';
         wp_mail($appt['email'], 'Appointment confirmed — ' . $clinic, fvc_bridge_email_shell('Your appointment is confirmed.', 'Appointment confirmed', $inner), $headers);
-        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment on ' . $when . ' is confirmed.');
+        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment on ' . $when . ' is confirmed.', (int) ($appt['listing_id'] ?? 0));
     } elseif ( $kind === 'cancelled' ) {
         $inner = '<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#3f3f46;">Hi ' . esc_html($appt['name']) . ' — your appointment below has been cancelled.</p>'
             . '<div style="background:#f7f7f7;border-left:3px solid #d0663f;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;"><strong>' . esc_html($clinic) . '</strong><br>' . esc_html($svc) . '<br>' . esc_html($when) . '</div>';
         wp_mail($appt['email'], 'Appointment cancelled — ' . $clinic, fvc_bridge_email_shell('Your appointment was cancelled.', 'Appointment cancelled', $inner), $headers);
-        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment on ' . $when . ' has been cancelled.');
+        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment on ' . $when . ' has been cancelled.', (int) ($appt['listing_id'] ?? 0));
     } elseif ( $kind === 'rescheduled' ) {
         $inner = '<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#3f3f46;">Hi ' . esc_html($appt['name']) . ' — your appointment has been moved to a new time.</p>'
             . '<div style="background:#f7f7f7;border-left:3px solid #09BDB8;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;"><strong>' . esc_html($clinic) . '</strong><br>' . esc_html($svc) . '<br><strong>' . esc_html($when) . '</strong></div>';
         wp_mail($appt['email'], 'Appointment rescheduled — ' . $clinic, fvc_bridge_email_shell('Your appointment was rescheduled.', 'Appointment rescheduled', $inner), $headers);
-        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment is now ' . $when . '.');
+        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment is now ' . $when . '.', (int) ($appt['listing_id'] ?? 0));
     }
 }
 
@@ -2717,7 +2734,7 @@ function fvc_bridge_booking_send_reminders() {
             $headers = array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>');
             wp_mail($r['email'], 'Reminder: your appointment at ' . $cfg['clinic'], fvc_bridge_email_shell('Appointment reminder.', 'Appointment reminder', $inner), $headers);
         }
-        fvc_bridge_send_sms($r['phone'] ?? '', 'Reminder — ' . $cfg['clinic'] . ': appointment ' . $when . '.');
+        fvc_bridge_send_sms($r['phone'] ?? '', 'Reminder — ' . $cfg['clinic'] . ': appointment ' . $when . '.', (int) $r['listing_id']);
         $wpdb->update($t, array('reminded' => 1), array('id' => (int) $r['id']));
         $sent++;
     }
@@ -2784,7 +2801,7 @@ function fvc_bridge_waitlist_notify($listing_id, $date) {
                 . '<a href="' . esc_url($bookUrl) . '" style="display:inline-block;background:#0a8f8b;color:#fff;padding:12px 22px;border-radius:999px;text-decoration:none;font-weight:600;">Book now</a>';
             wp_mail($r['email'], 'A spot opened at ' . $clinic, fvc_bridge_email_shell('A spot just opened.', 'A spot opened up', $inner), $headers);
         }
-        fvc_bridge_send_sms($r['phone'] ?? '', $clinic . ': a spot just opened' . ($r['wdate'] ? (' on ' . $r['wdate']) : '') . '. Book: ' . $bookUrl);
+        fvc_bridge_send_sms($r['phone'] ?? '', $clinic . ': a spot just opened' . ($r['wdate'] ? (' on ' . $r['wdate']) : '') . '. Book: ' . $bookUrl, (int) $listing_id);
         $wpdb->update($t, array('notified_at' => current_time('mysql')), array('id' => (int) $r['id']));
     }
 }
@@ -2979,6 +2996,51 @@ function fvc_bridge_rest_giftcard_verify($req) {
         wp_mail($c['email'], 'Your gift card — ' . $clinic, fvc_bridge_email_shell('Your gift card.', 'Your gift card', $inner), array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>'));
     }
     return new WP_REST_Response(array('ok' => true, 'code' => $c['code'], 'balanceCents' => (int) $c['init_cents'], 'currency' => $c['currency']), 200);
+}
+
+// ============================================================
+//  SMS prepaid credit — clinics load money (via the PLATFORM Stripe); texts are billed per message.
+// ============================================================
+function fvc_bridge_rest_sms_balance($req) {
+    $id = (int) $req->get_param('listing');
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    return new WP_REST_Response(array('ok' => true, 'balanceCents' => fvc_bridge_sms_balance($id), 'costCents' => fvc_bridge_sms_cost_cents(),
+        'platformOn' => fvc_bridge_stripe_platform_sk() !== '', 'smsOn' => (bool) ( get_option('fvc_twilio_sid') && get_option('fvc_twilio_from') )), 200);
+}
+function fvc_bridge_rest_sms_load($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $psk = fvc_bridge_stripe_platform_sk();
+    if ( ! $psk ) return new WP_REST_Response(array('ok' => false, 'error' => 'SMS credit isn\'t available yet.'), 400);
+    $amount = (int) round(((float) ($b['amount'] ?? 0)) * 100);
+    if ( $amount < 500 ) return new WP_REST_Response(array('ok' => false, 'error' => 'Minimum load is $5.'), 400);
+    $clinic = html_entity_decode(get_the_title($id), ENT_QUOTES);
+    $success = add_query_arg(array('smsload' => 1, 'sess' => '{CHECKOUT_SESSION_ID}'), home_url('/clinic-calendar/'));
+    $cancel = home_url('/clinic-calendar/?smsload=cancel');
+    // charged on the PLATFORM account (this funds SMS; revenue is the platform's)
+    $sess = fvc_bridge_stripe_api($psk, 'POST', 'checkout/sessions', array(
+        'mode' => 'payment', 'success_url' => $success, 'cancel_url' => $cancel,
+        'line_items[0][quantity]' => 1, 'line_items[0][price_data][currency]' => 'cad',
+        'line_items[0][price_data][unit_amount]' => $amount, 'line_items[0][price_data][product_data][name]' => 'SMS credit · ' . $clinic,
+        'metadata[sms_listing]' => (string) $id, 'metadata[sms_amount]' => (string) $amount,
+    ));
+    if ( empty($sess['url']) ) return new WP_REST_Response(array('ok' => false, 'error' => isset($sess['error']['message']) ? $sess['error']['message'] : 'Could not start payment.'), 502);
+    return new WP_REST_Response(array('ok' => true, 'checkoutUrl' => $sess['url']), 200);
+}
+function fvc_bridge_rest_sms_verify($req) {
+    $sessId = sanitize_text_field((string) $req->get_param('sess'));
+    if ( ! $sessId ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    $psk = fvc_bridge_stripe_platform_sk(); if ( ! $psk ) return new WP_REST_Response(array('ok' => false, 'error' => 'unavailable'), 400);
+    $s = fvc_bridge_stripe_api($psk, 'GET', 'checkout/sessions/' . rawurlencode($sessId));
+    if ( ($s['payment_status'] ?? '') !== 'paid' ) return new WP_REST_Response(array('ok' => false, 'pending' => true), 200);
+    $lid = (int) ($s['metadata']['sms_listing'] ?? 0); $amt = (int) ($s['metadata']['sms_amount'] ?? 0);
+    if ( ! $lid || ! $amt ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad session'), 400);
+    if ( ! fvc_bridge_booking_owns($lid) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $flag = 'fvc_smsc_' . md5($sessId);
+    if ( get_transient($flag) ) return new WP_REST_Response(array('ok' => true, 'balanceCents' => fvc_bridge_sms_balance($lid), 'already' => true), 200);
+    update_post_meta($lid, '_fvc_sms_balance_cents', fvc_bridge_sms_balance($lid) + $amt);
+    set_transient($flag, 1, 30 * DAY_IN_SECONDS);
+    return new WP_REST_Response(array('ok' => true, 'balanceCents' => fvc_bridge_sms_balance($lid), 'added' => $amt), 200);
 }
 
 // ============================================================
