@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.89
+ * Version: 1.16.91
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.89');
+define('FVC_BRIDGE_VERSION',    '1.16.91');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -2814,6 +2814,23 @@ add_action('fvc_bridge_booking_reminders_cron', 'fvc_bridge_booking_send_reminde
 add_action('init', function () {
     if ( ! wp_next_scheduled('fvc_bridge_booking_reminders_cron') ) wp_schedule_event(time() + 300, 'hourly', 'fvc_bridge_booking_reminders_cron');
 });
+
+// ---- SEO polish: default OG/Twitter image (homepage & any page missing one) + real /places/ archive title & meta ----
+define('FVC_BRIDGE_OG_DEFAULT', 'https://findvancouverclinics.com/wp-content/uploads/2026/09/pexels-5793695.jpg');
+function fvc_bridge_default_og_image($url) { return $url ? $url : FVC_BRIDGE_OG_DEFAULT; }
+add_filter('rank_math/opengraph/facebook/og_image', 'fvc_bridge_default_og_image', 20);
+add_filter('rank_math/opengraph/twitter/twitter_image', 'fvc_bridge_default_og_image', 20);
+// homepage uses a separate path in Rank Math and had NO image — inject one there (only when absent, so no duplicates)
+add_action('wp_head', function () {
+    if ( ( is_front_page() || is_home() ) && ! fvc_bridge_is_standalone() ) {
+        echo '<meta property="og:image" content="' . esc_url(FVC_BRIDGE_OG_DEFAULT) . '">' . "\n";
+        echo '<meta name="twitter:image" content="' . esc_url(FVC_BRIDGE_OG_DEFAULT) . '">' . "\n";
+        echo '<meta name="twitter:card" content="summary_large_image">' . "\n";
+    }
+}, 6);
+function fvc_bridge_is_places_archive() { return function_exists('is_post_type_archive') && is_post_type_archive('gd_place') && ! is_tax() && ! is_singular(); }
+add_filter('rank_math/frontend/title', function ($t) { return fvc_bridge_is_places_archive() ? 'Find & Compare Vancouver Health Clinics | Physio, Chiro, RMT, Naturopath & Acupuncture' : $t; }, 20);
+add_filter('rank_math/frontend/description', function ($d) { return fvc_bridge_is_places_archive() ? 'Browse and compare physiotherapy, chiropractic, massage therapy, naturopathic and acupuncture clinics across Vancouver — by neighbourhood, Google rating, ICBC direct billing and online booking.' : $d; }, 20);
 function fvc_bridge_rest_booking_run_reminders($req) {
     return new WP_REST_Response(array('ok' => true, 'sent' => fvc_bridge_booking_send_reminders()), 200);
 }
