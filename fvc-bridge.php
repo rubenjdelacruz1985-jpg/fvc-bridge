@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.82
+ * Version: 1.16.83
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.82');
+define('FVC_BRIDGE_VERSION',    '1.16.83');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -2436,7 +2436,7 @@ function fvc_bridge_rest_booking_list($req) {
 }
 function fvc_bridge_rest_booking_status($req) {
     $b = $req->get_json_params(); $aid = (int) ($b['id'] ?? 0); $status = sanitize_text_field($b['status'] ?? '');
-    if ( ! $aid || ! in_array($status, array('confirmed', 'cancelled', 'pending'), true) ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    if ( ! $aid || ! in_array($status, array('confirmed', 'cancelled', 'pending', 'no_show'), true) ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
     global $wpdb; $t = fvc_bridge_booking_table();
     $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
     if ( ! $row ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
