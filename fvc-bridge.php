@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.105
+ * Version: 1.16.106
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.105');
+define('FVC_BRIDGE_VERSION',    '1.16.106');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1052,6 +1052,9 @@ add_action('pre_get_posts', 'fvc_bridge_filter_query', 20);
 function fvc_bridge_filter_query($q) {
     if ( is_admin() || ! $q->is_main_query() ) return;
     if ( ! $q->is_post_type_archive('gd_place') && ! $q->is_tax('gd_placecategory') ) return;
+    // Default the listing order to "most reviewed" — GeoDirectory's own default is "latest" (newest
+    // listing first), which is a poor default for a directory. GeoDirectory reads $_REQUEST['sort_by'].
+    if ( empty($_REQUEST['sort_by']) ) { $_GET['sort_by'] = $_REQUEST['sort_by'] = 'google_review_count_desc'; }
     global $wpdb;
     $t = $wpdb->prefix . 'geodir_gd_place_detail';
     $yes = "IN ('1','Yes','yes')";
@@ -1066,29 +1069,11 @@ function fvc_bridge_filter_query($q) {
         if ( isset($map[$slug]) ) $where[] = $wpdb->prepare("TRIM(neighbourhood) = %s", $map[$slug]);
         else $where[] = '1=0';
     }
-    $sort = isset($_GET['sort']) ? sanitize_key($_GET['sort']) : '';
-    $hasFilter = ! empty($where);
-    if ( ! $hasFilter && ! $sort ) return;
-    $order = ''; $forceOrderby = '';
-    if ( $sort === 'rating' )       $order = "ORDER BY CAST(google_rating AS DECIMAL(3,2)) DESC, CAST(google_review_count AS UNSIGNED) DESC";
-    elseif ( $sort === 'reviews' )  $order = "ORDER BY CAST(google_review_count AS UNSIGNED) DESC";
-    elseif ( $sort === 'name' )     $forceOrderby = "{$wpdb->posts}.post_title ASC";
-    if ( $hasFilter || $order ) {
-        $wsql = $where ? ( 'WHERE ' . implode(' AND ', $where) ) : '';
-        $ids = $wpdb->get_col("SELECT post_id FROM {$t} {$wsql} {$order}");
-        $ids = array_values(array_filter(array_map('intval', (array) $ids)));
-        if ( empty($ids) ) $ids = array(0);
-        $q->set('post__in', $ids);
-        if ( $order ) $forceOrderby = "FIELD({$wpdb->posts}.ID, " . implode(',', $ids) . ")"; // preserve rating/review order
-    }
-    // GeoDirectory sets its own orderby late, so force ours later still (see fvc_bridge_force_orderby).
-    if ( $forceOrderby ) { $q->set('orderby', 'post__in'); $q->set('fvc_orderby_sql', $forceOrderby); }
-}
-// Force our sort past GeoDirectory's own orderby (which otherwise overrides post__in / title order).
-add_filter('posts_orderby', 'fvc_bridge_force_orderby', 9999, 2);
-function fvc_bridge_force_orderby($orderby, $q) {
-    $f = $q->get('fvc_orderby_sql');
-    return $f ? $f : $orderby;
+    if ( empty($where) ) return; // sorting is handled by GeoDirectory's native ?sort_by= (see the filter form)
+    $ids = $wpdb->get_col("SELECT post_id FROM {$t} WHERE " . implode(' AND ', $where));
+    $ids = array_values(array_filter(array_map('intval', (array) $ids)));
+    if ( empty($ids) ) $ids = array(0);
+    $q->set('post__in', $ids); // GeoDirectory's sort_by still orders these correctly
 }
 // Render the filter panel (used by the [fvc_sidebar_filter] shortcode in the archive template).
 function fvc_bridge_render_filter($atts = array()) {
@@ -1102,7 +1087,7 @@ function fvc_bridge_render_filter($atts = array()) {
     $action = $curCatHref ?: ( get_post_type_archive_link('gd_place') ?: home_url('/places/') );
     $g = function ($k) { return isset($_GET[$k]) ? sanitize_text_field(wp_unslash($_GET[$k])) : ''; };
     $areaSel = sanitize_title($g('hood'));
-    $sortSel = sanitize_key($g('sort'));
+    $sortSel = sanitize_key($g('sort_by')); if ( ! $sortSel ) $sortSel = 'google_review_count_desc';
     $ck = function ($k) { return ! empty($_GET[$k]) ? ' checked' : ''; };
     $anyActive = ($areaSel || $sortSel || ! empty($_GET['icbc']) || ! empty($_GET['worksafe']) || ! empty($_GET['billing']) || ! empty($_GET['booking']));
 
@@ -1137,7 +1122,14 @@ function fvc_bridge_render_filter($atts = array()) {
       <label class="fvc-fbar-check"><input type="checkbox" name="booking" value="1"<?php echo $ck('booking'); ?>> <span>Online booking</span></label>
     </div>
 
-    <p class="fvc-fbar-note">Best-rated clinics are shown first.</p>
+    <div class="fvc-fbar-group">
+      <span class="fvc-fbar-label">Sort by</span>
+      <select class="fvc-fbar-select" name="sort_by">
+        <option value="google_review_count_desc"<?php selected($sortSel, 'google_review_count_desc'); ?>>Most reviewed</option>
+        <option value="google_rating_desc"<?php selected($sortSel, 'google_rating_desc'); ?>>Highest rated</option>
+        <option value="az"<?php selected($sortSel, 'az'); ?>>Name (A&ndash;Z)</option>
+      </select>
+    </div>
 
     <button type="submit" class="fvc-fbar-apply">Show clinics</button>
   </form>
@@ -1233,18 +1225,8 @@ function fvc_bridge_archive_hero() {
       var l=s.querySelector('.fvc-hero-stat-label'), n=s.querySelector('.fvc-hero-stat-num');
       if(l&&n&&/special/i.test(l.textContent)) n.textContent=A.count;
     });
-    // category pills: make sure every category is present in each pill row
-    document.querySelectorAll('.fvc-hero-pills-bar,.fvc-hero-pills-scroll').forEach(function(wrap){
-      var pills=wrap.querySelectorAll(':scope > .fvc-hero-pill-new'); if(!pills.length) return;
-      var have={}; pills.forEach(function(p){have[(p.textContent||'').trim().toLowerCase()]=1;});
-      var anchor=pills[pills.length-1];
-      A.cats.forEach(function(c){ var k=c.n.toLowerCase(); if(have[k]) return;
-        var node=anchor.cloneNode(true); if(c.h) node.setAttribute('href',c.h);
-        var dot=node.querySelector('.fvc-hero-pill-dot-new'); node.textContent='';
-        if(dot) node.appendChild(dot); node.appendChild(document.createTextNode(c.n));
-        anchor.parentNode.insertBefore(node, anchor.nextSibling); anchor=node; have[k]=1;
-      });
-    });
+    // "Browse by category" pills are redundant now that Specialty is a filter facet — hide them.
+    document.querySelectorAll('.fvc-hero-pills-bar').forEach(function(el){ el.style.setProperty('display','none','important'); });
     // description (both category + all-clinics)
     var d=document.querySelector('.fvc-hero-desc'); if(d&&A.desc) d.textContent=A.desc;
     if(A.isCat){
