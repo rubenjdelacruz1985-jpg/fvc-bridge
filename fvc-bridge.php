@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.94
+ * Version: 1.16.97
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.94');
+define('FVC_BRIDGE_VERSION',    '1.16.97');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -994,9 +994,34 @@ function fvc_bridge_standalone_rm_title($title) {
 // Modernize the directory header (sticky glassy bar, gradient pill CTA, pill nav hovers) via a
 // scoped CSS overlay — no markup/JS changes, so the dropdown + mobile menu keep working.
 // Directory pages only (skipped on white-label clinic sites, which have their own chrome).
+// Data-driven clinic-category list for the nav/footer/home (auto-includes every category).
+// Curated order + short descriptions; any category not in the map is appended.
+function fvc_bridge_nav_categories() {
+    $map = array(
+        'physiotherapy-vancouver'   => 'Injury, pain & recovery',
+        'chiropractor-vancouver'    => 'Alignment & manual therapy',
+        'massage-therapy-vancouver' => 'Therapeutic & relaxation',
+        'kinesiology-vancouver'     => 'Active rehab & recovery',
+        'naturopath-vancouver'      => 'Natural, whole-body care',
+        'acupuncture-vancouver'     => 'Traditional pain & wellness',
+        'counselling-vancouver'     => 'Therapy & mental health',
+        'podiatry-vancouver'        => 'Foot & ankle care',
+        'dietitian-vancouver'       => 'Nutrition & dietitians',
+    );
+    $terms = get_terms(array('taxonomy' => 'gd_placecategory', 'hide_empty' => true));
+    if ( is_wp_error($terms) || ! $terms ) return array();
+    $bySlug = array(); foreach ( $terms as $t ) $bySlug[$t->slug] = $t;
+    $out = array(); $used = array();
+    foreach ( $map as $slug => $desc ) {
+        if ( isset($bySlug[$slug]) ) { $t = $bySlug[$slug]; $link = get_term_link($t); $out[] = array('n' => $t->name, 'h' => is_wp_error($link) ? '' : parse_url($link, PHP_URL_PATH), 'd' => $desc); $used[$slug] = 1; }
+    }
+    foreach ( $terms as $t ) { if ( ! isset($used[$t->slug]) ) { $link = get_term_link($t); $out[] = array('n' => $t->name, 'h' => is_wp_error($link) ? '' : parse_url($link, PHP_URL_PATH), 'd' => ''); } }
+    return array_values(array_filter($out, function ($c) { return ! empty($c['h']); }));
+}
 add_action('wp_head', 'fvc_bridge_header_css', 31);
 function fvc_bridge_header_css() {
     if ( fvc_bridge_is_standalone() ) return;
+    echo '<script>window.FVC_CATS=' . wp_json_encode(fvc_bridge_nav_categories()) . ';</script>' . "\n";
     echo <<<'HTML'
 <style id="fvc-header-modern">
 .elementor-location-header{position:sticky!important;top:0!important;z-index:1000!important;}
@@ -1100,6 +1125,7 @@ body .fvc-filter-title{color:rgba(255,255,255,.62)!important;}
   var QUICK=[{h:'/find-a-clinic-by-area/',l:'Find by area'},{h:'/icbc-approved-clinics-vancouver/',l:'ICBC-approved'},{h:'/worksafebc-approved-clinics-vancouver/',l:'WorkSafeBC-approved'},{h:'/places/',l:'All clinics'}];
   function esc(s){return (s||'').replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
   function services(){
+    if(window.FVC_CATS&&window.FVC_CATS.length)return window.FVC_CATS.map(function(c){return {name:c.n,href:c.h,desc:c.d};});
     var out=[],seen={};
     document.querySelectorAll('#fvcDropMenu a').forEach(function(a){
       if(/fvc-mega/.test(a.className||''))return;
@@ -1112,7 +1138,7 @@ body .fvc-filter-title{color:rgba(255,255,255,.62)!important;}
   function buildDesktop(svc){
     var menu=document.getElementById('fvcDropMenu');
     if(!menu||menu.getAttribute('data-mega'))return;
-    var g='';svc.forEach(function(s){g+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(DESC[s.name.toLowerCase()]||'')+'</span></a>';});
+    var g='';svc.forEach(function(s){g+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(s.desc||DESC[s.name.toLowerCase()]||'')+'</span></a>';});
     var ql='';QUICK.forEach(function(q){ql+='<a class="fvc-mega-ql" href="'+q.h+'"><span class="fvc-ql-dot"></span><span>'+q.l+'</span></a>';});
     menu.innerHTML='<div class="fvc-mega-main"><span class="fvc-mega-label">Browse by specialty</span><div class="fvc-mega-grid">'+g+'</div><a class="fvc-mega-all" href="/places/">View all clinics <span>&rarr;</span></a></div>'+
       '<div class="fvc-mega-rail"><span class="fvc-mega-label">Quick links</span>'+ql+
@@ -1124,7 +1150,7 @@ body .fvc-filter-title{color:rgba(255,255,255,.62)!important;}
     if(!mm||mm.getAttribute('data-mega'))return;
     var h='<a class="fvc-mm-ai-top" href="/vancouver-clinic-finder/"><span class="fvc-mm-ai-t">AI Clinic Finder <span class="fvc-mm-chip">AI</span></span><span class="fvc-mm-ai-d">Describe your issue &mdash; get matched in seconds</span></a>';
     h+='<span class="fvc-mobile-section-label">Browse by specialty</span><div class="fvc-mm-grid">';
-    svc.forEach(function(s){h+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(DESC[s.name.toLowerCase()]||'')+'</span></a>';});
+    svc.forEach(function(s){h+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(s.desc||DESC[s.name.toLowerCase()]||'')+'</span></a>';});
     h+='</div><span class="fvc-mobile-section-label">Quick links</span>';
     h+='<a class="fvc-mm-ql" data-fvc-area="/find-a-clinic-by-area/" href="/find-a-clinic-by-area/">Find by area</a>';
     h+='<a class="fvc-mm-ql" href="/icbc-approved-clinics-vancouver/">ICBC-approved</a>';
@@ -1221,6 +1247,55 @@ function fvc_bridge_nav_area_link() {
     document.querySelectorAll('.fvc-mobile-menu').forEach(function(n){LINKS.forEach(function(k){if(!n.querySelector('[data-fvc-area="'+k.h+'"]'))n.appendChild(mk(k));});});
     var foot=document.querySelector('footer');
     if(foot){var ws=Array.prototype.slice.call(foot.querySelectorAll('a')).filter(function(a){return /worksafebc-approved/.test(a.getAttribute('href')||'');})[0];if(ws&&ws.parentNode){LINKS.forEach(function(k){if(!foot.querySelector('[data-fvc-area="'+k.h+'"]'))ws.parentNode.insertBefore(mk(k,ws.className||''),ws.nextSibling);});}}
+  }
+  if(document.readyState!=='loading')add();else document.addEventListener('DOMContentLoaded',add);
+})();</script>
+HTML;
+}
+
+// Ensure the footer lists EVERY clinic category (the theme footer hardcoded the original 5).
+// Injects any missing category links after the last existing footer category link, matching its style.
+add_action('wp_footer', 'fvc_bridge_footer_categories', 97);
+function fvc_bridge_footer_categories() {
+    if ( fvc_bridge_is_standalone() ) return;
+    echo <<<'HTML'
+<script>(function(){
+  var CATS=window.FVC_CATS||[];if(!CATS.length)return;
+  function add(){
+    var foot=document.querySelector('footer');if(!foot)return;
+    var links=Array.prototype.slice.call(foot.querySelectorAll('a[href*="/places/category/"]'));
+    if(!links.length)return;
+    var anchor=links[links.length-1];var cls=anchor.className||'';var have={};
+    links.forEach(function(a){var m=(a.getAttribute('href')||'').match(/\/category\/([^\/]+)/);if(m)have[m[1]]=1;});
+    CATS.forEach(function(c){var m=(c.h||'').match(/\/category\/([^\/]+)/);var slug=m?m[1]:'';if(!slug||have[slug])return;
+      var a=document.createElement('a');a.href=c.h;a.textContent=c.n;if(cls)a.className=cls;a.setAttribute('data-fvc-cat',slug);
+      anchor.parentNode.insertBefore(a,anchor.nextSibling);anchor=a;have[slug]=1;});
+  }
+  if(document.readyState!=='loading')add();else document.addEventListener('DOMContentLoaded',add);
+})();</script>
+HTML;
+}
+
+// Complete the homepage "Browse by specialty" grid with every category (it hardcoded the first 5).
+// Clones the existing card structure so styling matches; sets a fitting image per new category.
+add_action('wp_footer', 'fvc_bridge_home_categories', 98);
+function fvc_bridge_home_categories() {
+    if ( fvc_bridge_is_standalone() ) return;
+    echo <<<'HTML'
+<script>(function(){
+  var CATS=window.FVC_CATS||[];if(!CATS.length)return;
+  var U='https://findvancouverclinics.com/wp-content/uploads/2026/09/';
+  var IMG={'counselling-vancouver':U+'pexels-7615621.jpg','kinesiology-vancouver':U+'pexels-5793895.jpg','podiatry-vancouver':U+'pexels-5793695.jpg','dietitian-vancouver':U+'pexels-6111589.jpg'};
+  function add(){
+    var grid=document.querySelector('.fvc-cats-grid');if(!grid)return;
+    var cards=grid.querySelectorAll('.fvc-cat-card');if(!cards.length)return;
+    var have={};cards.forEach(function(a){var m=(a.getAttribute('href')||'').match(/\/category\/([^\/]+)/);if(m)have[m[1]]=1;});
+    var tmpl=cards[cards.length-1];
+    CATS.forEach(function(c){var m=(c.h||'').match(/\/category\/([^\/]+)/);var slug=m?m[1]:'';if(!slug||have[slug])return;
+      var node=tmpl.cloneNode(true);node.setAttribute('href',c.h);node.setAttribute('data-fvc-cat',slug);
+      var nm=node.querySelector('.fvc-cat-name');if(nm)nm.textContent=c.n;
+      var im=node.querySelector('.fvc-cat-img');if(im&&IMG[slug])im.style.backgroundImage="url('"+IMG[slug]+"')";
+      grid.appendChild(node);have[slug]=1;});
   }
   if(document.readyState!=='loading')add();else document.addEventListener('DOMContentLoaded',add);
 })();</script>
@@ -2912,9 +2987,9 @@ function fvc_bridge_is_places_archive() { return function_exists('is_post_type_a
 add_filter('rank_math/frontend/title', function ($t) {
     // Lead the homepage title with the brand so Google shows "Find Vancouver Clinics" as the site name (not the domain).
     if ( is_front_page() || is_home() ) return 'Find Vancouver Clinics — Physiotherapy, Chiropractic, Massage, Naturopath & Acupuncture';
-    return fvc_bridge_is_places_archive() ? 'Find & Compare Vancouver Health Clinics | Physio, Chiro, RMT, Naturopath & Acupuncture' : $t;
+    return fvc_bridge_is_places_archive() ? 'Find & Compare Vancouver Health Clinics | Physio, Chiro, Massage, Counselling & More' : $t;
 }, 20);
-add_filter('rank_math/frontend/description', function ($d) { return fvc_bridge_is_places_archive() ? 'Browse and compare physiotherapy, chiropractic, massage therapy, naturopathic and acupuncture clinics across Vancouver — by neighbourhood, Google rating, ICBC direct billing and online booking.' : $d; }, 20);
+add_filter('rank_math/frontend/description', function ($d) { return fvc_bridge_is_places_archive() ? 'Browse and compare Vancouver health clinics — physiotherapy, chiropractic, massage, counselling, kinesiology, podiatry, dietitians, naturopathy and acupuncture — by neighbourhood, Google rating, ICBC direct billing and online booking.' : $d; }, 20);
 function fvc_bridge_rest_booking_run_reminders($req) {
     return new WP_REST_Response(array('ok' => true, 'sent' => fvc_bridge_booking_send_reminders()), 200);
 }
