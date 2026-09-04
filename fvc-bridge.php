@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.103
+ * Version: 1.16.105
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.103');
+define('FVC_BRIDGE_VERSION',    '1.16.105');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1069,18 +1069,26 @@ function fvc_bridge_filter_query($q) {
     $sort = isset($_GET['sort']) ? sanitize_key($_GET['sort']) : '';
     $hasFilter = ! empty($where);
     if ( ! $hasFilter && ! $sort ) return;
-    $order = '';
+    $order = ''; $forceOrderby = '';
     if ( $sort === 'rating' )       $order = "ORDER BY CAST(google_rating AS DECIMAL(3,2)) DESC, CAST(google_review_count AS UNSIGNED) DESC";
     elseif ( $sort === 'reviews' )  $order = "ORDER BY CAST(google_review_count AS UNSIGNED) DESC";
+    elseif ( $sort === 'name' )     $forceOrderby = "{$wpdb->posts}.post_title ASC";
     if ( $hasFilter || $order ) {
         $wsql = $where ? ( 'WHERE ' . implode(' AND ', $where) ) : '';
         $ids = $wpdb->get_col("SELECT post_id FROM {$t} {$wsql} {$order}");
         $ids = array_values(array_filter(array_map('intval', (array) $ids)));
         if ( empty($ids) ) $ids = array(0);
         $q->set('post__in', $ids);
-        if ( $order ) $q->set('orderby', 'post__in'); // preserve the rating / review order
+        if ( $order ) $forceOrderby = "FIELD({$wpdb->posts}.ID, " . implode(',', $ids) . ")"; // preserve rating/review order
     }
-    if ( ! $order && $sort === 'name' ) { $q->set('orderby', 'title'); $q->set('order', 'ASC'); }
+    // GeoDirectory sets its own orderby late, so force ours later still (see fvc_bridge_force_orderby).
+    if ( $forceOrderby ) { $q->set('orderby', 'post__in'); $q->set('fvc_orderby_sql', $forceOrderby); }
+}
+// Force our sort past GeoDirectory's own orderby (which otherwise overrides post__in / title order).
+add_filter('posts_orderby', 'fvc_bridge_force_orderby', 9999, 2);
+function fvc_bridge_force_orderby($orderby, $q) {
+    $f = $q->get('fvc_orderby_sql');
+    return $f ? $f : $orderby;
 }
 // Render the filter panel (used by the [fvc_sidebar_filter] shortcode in the archive template).
 function fvc_bridge_render_filter($atts = array()) {
@@ -1129,15 +1137,7 @@ function fvc_bridge_render_filter($atts = array()) {
       <label class="fvc-fbar-check"><input type="checkbox" name="booking" value="1"<?php echo $ck('booking'); ?>> <span>Online booking</span></label>
     </div>
 
-    <div class="fvc-fbar-group">
-      <span class="fvc-fbar-label">Sort by</span>
-      <select class="fvc-fbar-select" name="sort">
-        <option value=""<?php selected($sortSel, ''); ?>>Best match</option>
-        <option value="rating"<?php selected($sortSel, 'rating'); ?>>Highest rated</option>
-        <option value="reviews"<?php selected($sortSel, 'reviews'); ?>>Most reviewed</option>
-        <option value="name"<?php selected($sortSel, 'name'); ?>>Name (A–Z)</option>
-      </select>
-    </div>
+    <p class="fvc-fbar-note">Best-rated clinics are shown first.</p>
 
     <button type="submit" class="fvc-fbar-apply">Show clinics</button>
   </form>
@@ -1162,6 +1162,7 @@ function fvc_bridge_render_filter($atts = array()) {
 .fvc-fbar-select{width:100%;padding:11px 12px;border:1px solid rgba(9,9,11,.16);border-radius:8px;font-size:14px;color:#09090B;background:#fff;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236e6e73' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
 .fvc-fbar-check{display:flex;align-items:center;gap:10px;font-size:14px;color:#33333a;cursor:pointer;padding:3px 0;}
 .fvc-fbar-check input{width:18px;height:18px;accent-color:#09BDB8;cursor:pointer;flex:none;}
+.fvc-fbar-note{margin:0;font-size:12px;color:#8a8a8f;}
 .fvc-fbar-apply{padding:13px;border:0;border-radius:8px;background:linear-gradient(135deg,#12c7c1,#0a9b96);color:#fff;font-size:15px;font-weight:600;cursor:pointer;box-shadow:0 6px 18px rgba(9,189,184,.28);}
 .fvc-fbar-apply:hover{transform:translateY(-1px);}
 @media(max-width:1024px){
