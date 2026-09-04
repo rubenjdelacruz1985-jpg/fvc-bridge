@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.81
+ * Version: 1.16.82
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.81');
+define('FVC_BRIDGE_VERSION',    '1.16.82');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -218,6 +218,8 @@ add_action('rest_api_init', function () {
     register_rest_route('fvc-bridge/v1', '/booking-verify-payment', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_verify_payment'));
     register_rest_route('fvc-bridge/v1', '/booking-webhook', array('methods'=>'POST','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_webhook'));
     register_rest_route('fvc-bridge/v1', '/booking-run-reminders', array('methods'=>'POST','permission_callback'=>function(){return fvc_bridge_has_valid_token()||current_user_can('manage_options');},'callback'=>'fvc_bridge_rest_booking_run_reminders'));
+    register_rest_route('fvc-bridge/v1', '/booking-appt', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_appt'));
+    register_rest_route('fvc-bridge/v1', '/booking-reschedule', array('methods'=>'POST','permission_callback'=>'fvc_bridge_require_token_or_public','callback'=>'fvc_bridge_rest_booking_reschedule'));
     register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
     // Public read: a clinic's listing data, formatted to seed the site builder.
     register_rest_route('fvc-bridge/v1', '/clinic-data', array(
@@ -1991,7 +1993,7 @@ function fvc_bridge_booking_table() { global $wpdb; return $wpdb->prefix . 'fvc_
 function fvc_bridge_booking_ensure_table() {
     global $wpdb;
     $t = fvc_bridge_booking_table();
-    if ( get_option('fvc_bridge_booking_db') === '3' ) return;
+    if ( get_option('fvc_bridge_booking_db') === '4' ) return;
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     $charset = $wpdb->get_charset_collate();
     dbDelta("CREATE TABLE $t (
@@ -2013,12 +2015,13 @@ function fvc_bridge_booking_ensure_table() {
         stripe_session VARCHAR(120) DEFAULT '',
         refunded TINYINT DEFAULT 0,
         reminded TINYINT DEFAULT 0,
+        intake TEXT,
         created_at DATETIME NOT NULL,
         PRIMARY KEY (id),
         KEY listing_id (listing_id),
         KEY start_local (start_local)
     ) $charset;");
-    update_option('fvc_bridge_booking_db', '3');
+    update_option('fvc_bridge_booking_db', '4');
 }
 
 function fvc_bridge_booking_defaults($listing_id) {
@@ -2036,10 +2039,11 @@ function fvc_bridge_booking_defaults($listing_id) {
         ),
         'slotMinutes' => 45, 'timezone' => 'America/Vancouver',
         // scheduling policy
-        'minNoticeHours' => 2, 'bufferMinutes' => 0, 'maxAdvanceDays' => 60,
+        'minNoticeHours' => 2, 'bufferMinutes' => 0, 'maxAdvanceDays' => 60, 'cancelWindowHours' => 24,
         // payments (per-clinic Stripe; secret key stored separately in _fvc_booking_sk)
         'pay' => array('mode' => 'off', 'depositType' => 'fixed', 'depositAmount' => 0, 'currency' => 'cad', 'pk' => ''),
         'reminders' => true,
+        'intake' => array(), // custom questions: [{q, type:'text'|'textarea', required:bool}]
     );
 }
 // Compute the amount owed (in cents) for a service under the pay config; 0 = no upfront payment.
@@ -2106,7 +2110,12 @@ function fvc_bridge_rest_booking_config_save($req) {
         'minNoticeHours' => max(0, (int) ($b['minNoticeHours'] ?? 2)),
         'bufferMinutes' => max(0, (int) ($b['bufferMinutes'] ?? 0)),
         'maxAdvanceDays' => min(365, max(1, (int) ($b['maxAdvanceDays'] ?? 60))),
+        'cancelWindowHours' => max(0, (int) ($b['cancelWindowHours'] ?? 24)),
         'reminders' => ! empty($b['reminders']),
+        'intake' => array_values(array_filter(array_map(function ($q) {
+            $qt = sanitize_text_field($q['q'] ?? '');
+            return $qt === '' ? null : array('q' => $qt, 'type' => in_array(($q['type'] ?? 'text'), array('text','textarea'), true) ? $q['type'] : 'text', 'required' => ! empty($q['required']));
+        }, (array) ($b['intake'] ?? array())))),
         'pay' => array(
             'mode' => $mode,
             'depositType' => in_array(($payIn['depositType'] ?? 'fixed'), array('fixed','percent'), true) ? $payIn['depositType'] : 'fixed',
@@ -2242,11 +2251,13 @@ function fvc_bridge_booking_emails_new($appt, $cfg, $manageUrl) {
             . '<p style="margin:16px 0 0;font-size:13px;color:#6b6b6e;">Need to change it? <a href="' . esc_url($manageUrl) . '" style="color:#0a8f8b;">Manage your booking</a>.</p>';
         wp_mail($appt['email'], 'Your appointment request — ' . $clinic, fvc_bridge_email_shell('Your appointment request is in.', 'Appointment requested', $inner), $headers);
     }
+    $intakeHtml = '';
+    if ( ! empty($appt['intake']) ) { $ia = json_decode($appt['intake'], true); if ( is_array($ia) ) foreach ( $ia as $qa ) $intakeHtml .= '<br><strong>' . esc_html($qa['q'] ?? '') . ':</strong> ' . esc_html($qa['a'] ?? ''); }
     $owner = get_userdata((int) get_post_field('post_author', $appt['listing_id']));
     $clinicEmail = $owner && is_email($owner->user_email) ? $owner->user_email : get_option('admin_email');
     if ( is_email($clinicEmail) ) {
         $ci = '<p style="margin:0 0 14px;font-size:15px;color:#3f3f46;">New booking request for <strong>' . esc_html($clinic) . '</strong>:</p>'
-            . '<div style="background:#f7f7f7;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;">' . esc_html($appt['name']) . ' &middot; ' . esc_html($appt['email']) . ( ! empty($appt['phone']) ? ' &middot; ' . esc_html($appt['phone']) : '') . '<br>' . esc_html($svc) . ($pract ? ' with ' . esc_html($pract) : '') . '<br>' . esc_html($when) . ( ! empty($appt['notes']) ? '<br><em>' . esc_html($appt['notes']) . '</em>' : '') . '</div>' . $paidNote;
+            . '<div style="background:#f7f7f7;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;">' . esc_html($appt['name']) . ' &middot; ' . esc_html($appt['email']) . ( ! empty($appt['phone']) ? ' &middot; ' . esc_html($appt['phone']) : '') . '<br>' . esc_html($svc) . ($pract ? ' with ' . esc_html($pract) : '') . '<br>' . esc_html($when) . ( ! empty($appt['notes']) ? '<br><em>' . esc_html($appt['notes']) . '</em>' : '') . $intakeHtml . '</div>' . $paidNote;
         wp_mail($clinicEmail, 'New booking request — ' . $appt['name'], fvc_bridge_email_shell('New booking request.', 'New booking request', $ci), $headers);
     }
     fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': appointment request received for ' . $when . '. We\'ll confirm shortly.');
@@ -2270,6 +2281,11 @@ function fvc_bridge_booking_notify_patient($appt, $cfg, $kind) {
             . '<div style="background:#f7f7f7;border-left:3px solid #d0663f;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;"><strong>' . esc_html($clinic) . '</strong><br>' . esc_html($svc) . '<br>' . esc_html($when) . '</div>';
         wp_mail($appt['email'], 'Appointment cancelled — ' . $clinic, fvc_bridge_email_shell('Your appointment was cancelled.', 'Appointment cancelled', $inner), $headers);
         fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment on ' . $when . ' has been cancelled.');
+    } elseif ( $kind === 'rescheduled' ) {
+        $inner = '<p style="margin:0 0 14px;font-size:15px;line-height:1.6;color:#3f3f46;">Hi ' . esc_html($appt['name']) . ' — your appointment has been moved to a new time.</p>'
+            . '<div style="background:#f7f7f7;border-left:3px solid #09BDB8;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;"><strong>' . esc_html($clinic) . '</strong><br>' . esc_html($svc) . '<br><strong>' . esc_html($when) . '</strong></div>';
+        wp_mail($appt['email'], 'Appointment rescheduled — ' . $clinic, fvc_bridge_email_shell('Your appointment was rescheduled.', 'Appointment rescheduled', $inner), $headers);
+        fvc_bridge_send_sms($appt['phone'] ?? '', $clinic . ': your appointment is now ' . $when . '.');
     }
 }
 
@@ -2284,6 +2300,15 @@ function fvc_bridge_rest_booking_create($req) {
     $date = preg_replace('/[^0-9\-]/', '', $b['date'] ?? ''); $time = preg_replace('/[^0-9:]/', '', $b['time'] ?? '');
     $notes = sanitize_textarea_field($b['notes'] ?? '');
     if ( ! $name || ! is_email($email) || ! $date || ! $time ) return new WP_REST_Response(array('ok' => false, 'error' => 'missing details'), 400);
+    // intake questions
+    $intakeIn = ( isset($b['intake']) && is_array($b['intake']) ) ? $b['intake'] : array();
+    $intakePairs = array();
+    foreach ( (array) ($cfg['intake'] ?? array()) as $qi => $q ) {
+        $ans = sanitize_textarea_field((string) ($intakeIn[$qi] ?? ''));
+        if ( ! empty($q['required']) && $ans === '' ) return new WP_REST_Response(array('ok' => false, 'error' => 'Please answer: ' . $q['q']), 400);
+        if ( $ans !== '' ) $intakePairs[] = array('q' => $q['q'], 'a' => $ans);
+    }
+    $intakeJson = $intakePairs ? wp_json_encode($intakePairs) : '';
     $dur = (int) $cfg['slotMinutes'];
     foreach ( $cfg['services'] as $s ) { if ( $s['name'] === $svc ) { $dur = (int) $s['duration']; break; } }
     if ( $dur < 15 ) $dur = 45;
@@ -2311,12 +2336,12 @@ function fvc_bridge_rest_booking_create($req) {
         'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
         'start_local' => $s, 'end_local' => $e, 'name' => $name, 'email' => $email, 'phone' => $phone,
         'notes' => $notes, 'status' => $needPay ? 'awaiting_payment' : 'pending', 'manage_key' => $key,
-        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'created_at' => current_time('mysql'),
+        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'intake' => $intakeJson, 'created_at' => current_time('mysql'),
     ));
     $aid = (int) $wpdb->insert_id;
     $appt = array('id' => $aid, 'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
         'start_local' => $s, 'end_local' => $e, 'name' => $name, 'email' => $email, 'phone' => $phone, 'notes' => $notes,
-        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur);
+        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'intake' => $intakeJson);
     $when = $start->format('l, F j') . ' at ' . $start->format('g:i a');
     $manageUrl = add_query_arg(array('appt' => $aid, 'key' => $key), home_url('/booking-manage/'));
     $icsUrl = add_query_arg(array('appt' => $aid, 'key' => $key), rest_url('fvc-bridge/v1/booking-ics'));
@@ -2403,7 +2428,7 @@ function fvc_bridge_rest_booking_list($req) {
     $id = (int) $req->get_param('listing');
     if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
     global $wpdb; $t = fvc_bridge_booking_table();
-    $rows = $wpdb->get_results($wpdb->prepare("SELECT id,service,practitioner,start_local,end_local,name,email,phone,status,paid,amount_cents,currency FROM $t WHERE listing_id=%d AND status!='awaiting_payment' ORDER BY start_local DESC LIMIT 500", $id), ARRAY_A);
+    $rows = $wpdb->get_results($wpdb->prepare("SELECT id,service,practitioner,start_local,end_local,name,email,phone,status,paid,amount_cents,currency,notes,intake FROM $t WHERE listing_id=%d AND status!='awaiting_payment' ORDER BY start_local DESC LIMIT 500", $id), ARRAY_A);
     $feedKey = get_post_meta($id, '_fvc_booking_feedkey', true);
     if ( ! $feedKey ) { $feedKey = wp_generate_password(20, false); update_post_meta($id, '_fvc_booking_feedkey', $feedKey); }
     $feedUrl = add_query_arg(array('listing' => $id, 'key' => $feedKey), rest_url('fvc-bridge/v1/booking-feed'));
@@ -2416,9 +2441,20 @@ function fvc_bridge_rest_booking_status($req) {
     $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
     if ( ! $row ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
     $key = sanitize_text_field($b['key'] ?? '');
-    $allowed = fvc_bridge_booking_owns((int) $row['listing_id']) || ( $key && hash_equals($row['manage_key'], $key) && $status === 'cancelled' );
+    $isOwner = fvc_bridge_booking_owns((int) $row['listing_id']);
+    $allowed = $isOwner || ( $key && hash_equals($row['manage_key'], $key) && $status === 'cancelled' );
     if ( ! $allowed ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
     if ( $row['status'] === $status ) return new WP_REST_Response(array('ok' => true, 'status' => $status), 200);
+    // patients can't cancel online inside the clinic's cancellation window (owner always can)
+    if ( ! $isOwner && $status === 'cancelled' ) {
+        $cfgW = fvc_bridge_booking_get_config((int) $row['listing_id']);
+        $cw = (int) ($cfgW['cancelWindowHours'] ?? 0);
+        if ( $cw > 0 ) {
+            $tzW = new DateTimeZone($cfgW['timezone']);
+            $st = DateTime::createFromFormat('Y-m-d H:i:s', $row['start_local'], $tzW);
+            if ( $st ) { $dl = clone $st; $dl->modify('-' . $cw . ' hours'); if ( new DateTime('now', $tzW) > $dl ) return new WP_REST_Response(array('ok' => false, 'error' => 'It\'s too close to your appointment to cancel online — please call the clinic.'), 400); }
+        }
+    }
     $wpdb->update($t, array('status' => $status), array('id' => $aid));
     $cfg = fvc_bridge_booking_get_config((int) $row['listing_id']);
     $cfg['clinic'] = html_entity_decode(get_the_title((int) $row['listing_id']), ENT_QUOTES);
@@ -2437,6 +2473,82 @@ function fvc_bridge_rest_booking_status($req) {
     }
     if ( $status === 'confirmed' || $status === 'cancelled' ) fvc_bridge_booking_notify_patient($row, $cfg, $status);
     return new WP_REST_Response(array('ok' => true, 'status' => $status, 'refunded' => $refunded), 200);
+}
+
+// Patient-facing appointment summary (by appt + manage key) — powers the manage/reschedule page.
+function fvc_bridge_rest_booking_appt($req) {
+    $aid = (int) $req->get_param('appt'); $key = sanitize_text_field((string) $req->get_param('key'));
+    if ( ! $aid || ! $key ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
+    if ( ! $row || ! hash_equals($row['manage_key'], $key) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    $cfg = fvc_bridge_booking_get_config((int) $row['listing_id']);
+    $tz = new DateTimeZone($cfg['timezone']);
+    $st = DateTime::createFromFormat('Y-m-d H:i:s', $row['start_local'], $tz);
+    $when = $st ? ($st->format('l, F j') . ' at ' . $st->format('g:i a')) : '';
+    $cw = (int) ($cfg['cancelWindowHours'] ?? 0); $canModify = ( $row['status'] !== 'cancelled' );
+    if ( $canModify && $cw > 0 && $st ) { $dl = clone $st; $dl->modify('-' . $cw . ' hours'); if ( new DateTime('now', $tz) > $dl ) $canModify = false; }
+    return new WP_REST_Response(array(
+        'ok' => true, 'listingId' => (int) $row['listing_id'], 'clinic' => html_entity_decode(get_the_title((int) $row['listing_id']), ENT_QUOTES),
+        'service' => $row['service'], 'practitioner' => $row['practitioner'], 'when' => $when,
+        'date' => $st ? $st->format('Y-m-d') : '', 'time' => $st ? $st->format('H:i') : '',
+        'status' => $row['status'], 'paid' => (int) $row['paid'], 'canModify' => $canModify, 'cancelWindowHours' => $cw,
+    ), 200);
+}
+
+// Patient self-reschedule (appt + manage key) to a new open slot.
+function fvc_bridge_rest_booking_reschedule($req) {
+    $b = $req->get_json_params();
+    $aid = (int) ($b['id'] ?? 0); $key = sanitize_text_field($b['key'] ?? '');
+    $date = preg_replace('/[^0-9\-]/', '', $b['date'] ?? ''); $time = preg_replace('/[^0-9:]/', '', $b['time'] ?? '');
+    if ( ! $aid || ! $key || ! $date || ! $time ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
+    if ( ! $row || ! hash_equals($row['manage_key'], $key) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    if ( $row['status'] === 'cancelled' ) return new WP_REST_Response(array('ok' => false, 'error' => 'This appointment was cancelled.'), 400);
+    $cfg = fvc_bridge_booking_get_config((int) $row['listing_id']);
+    $cfg['clinic'] = html_entity_decode(get_the_title((int) $row['listing_id']), ENT_QUOTES);
+    $tz = new DateTimeZone($cfg['timezone']);
+    $curStart = DateTime::createFromFormat('Y-m-d H:i:s', $row['start_local'], $tz);
+    $curEnd = DateTime::createFromFormat('Y-m-d H:i:s', $row['end_local'], $tz);
+    $cw = (int) ($cfg['cancelWindowHours'] ?? 0);
+    if ( $cw > 0 && $curStart ) { $dl = clone $curStart; $dl->modify('-' . $cw . ' hours'); if ( new DateTime('now', $tz) > $dl ) return new WP_REST_Response(array('ok' => false, 'error' => 'It\'s too close to your appointment to reschedule online — please call the clinic.'), 400); }
+    $dur = ($curStart && $curEnd) ? max(15, (int) round(($curEnd->getTimestamp() - $curStart->getTimestamp()) / 60)) : (int) $cfg['slotMinutes'];
+    $start = DateTime::createFromFormat('Y-m-d H:i', $date . ' ' . $time, $tz);
+    if ( ! $start ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad time'), 400);
+    $end = clone $start; $end->modify('+' . $dur . ' minutes');
+    $wk = strtolower(substr($start->format('l'), 0, 3));
+    $hours = $cfg['hours'][$wk] ?? array();
+    if ( count($hours) < 2 ) return new WP_REST_Response(array('ok' => false, 'error' => 'The clinic is closed that day.'), 400);
+    $po = explode(':', $hours[0]); $open = clone $start; $open->setTime((int) $po[0], (int) ($po[1] ?? 0));
+    $pc = explode(':', $hours[1]); $close = clone $start; $close->setTime((int) $pc[0], (int) ($pc[1] ?? 0));
+    if ( $start < $open || $end > $close ) return new WP_REST_Response(array('ok' => false, 'error' => 'Please pick a time within opening hours.'), 400);
+    $minTime = new DateTime('now', $tz); $mn = (int) ($cfg['minNoticeHours'] ?? 0); if ( $mn > 0 ) $minTime->modify('+' . $mn . ' hours');
+    if ( $start < $minTime ) return new WP_REST_Response(array('ok' => false, 'error' => 'Please pick a later time.'), 400);
+    $limit = new DateTime('now', $tz); $limit->setTime(23, 59, 59); $limit->modify('+' . (int) ($cfg['maxAdvanceDays'] ?? 60) . ' days');
+    if ( $start > $limit ) return new WP_REST_Response(array('ok' => false, 'error' => 'That date is too far ahead.'), 400);
+    $s = $start->format('Y-m-d H:i:s'); $e = $end->format('Y-m-d H:i:s');
+    $freshHold = "(status!='awaiting_payment' OR created_at > (NOW() - INTERVAL 30 MINUTE))";
+    if ( $row['practitioner'] ) {
+        $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND id!=%d AND status!='cancelled' AND $freshHold AND practitioner=%s AND %s<end_local AND %s>start_local", (int) $row['listing_id'], $aid, $row['practitioner'], $s, $e));
+    } else {
+        $clash = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM $t WHERE listing_id=%d AND id!=%d AND status!='cancelled' AND $freshHold AND %s<end_local AND %s>start_local", (int) $row['listing_id'], $aid, $s, $e));
+    }
+    if ( $clash > 0 ) return new WP_REST_Response(array('ok' => false, 'error' => 'That time was just taken — please pick another.'), 409);
+    $wpdb->update($t, array('start_local' => $s, 'end_local' => $e, 'reminded' => 0), array('id' => $aid));
+    $row['start_local'] = $s; $row['end_local'] = $e;
+    fvc_bridge_booking_notify_patient($row, $cfg, 'rescheduled');
+    $when = $start->format('l, F j') . ' at ' . $start->format('g:i a');
+    if ( function_exists('fvc_bridge_email_shell') ) {
+        $owner = get_userdata((int) get_post_field('post_author', (int) $row['listing_id']));
+        $clinicEmail = $owner && is_email($owner->user_email) ? $owner->user_email : get_option('admin_email');
+        if ( is_email($clinicEmail) ) {
+            $ci = '<p style="margin:0 0 14px;font-size:15px;color:#3f3f46;">' . esc_html($row['name']) . ' rescheduled their appointment at <strong>' . esc_html($cfg['clinic']) . '</strong>.</p>'
+                . '<div style="background:#f7f7f7;border-radius:8px;padding:14px 16px;font-size:14px;color:#3f3f46;">' . esc_html($row['service'] ?: 'Appointment') . '<br><strong>' . esc_html($when) . '</strong></div>';
+            wp_mail($clinicEmail, 'Appointment rescheduled — ' . $row['name'], fvc_bridge_email_shell('Appointment rescheduled.', 'Appointment rescheduled', $ci), array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>'));
+        }
+    }
+    return new WP_REST_Response(array('ok' => true, 'when' => $when), 200);
 }
 function fvc_bridge_rest_booking_ics($req) {
     $aid = (int) $req->get_param('appt'); $key = sanitize_text_field((string) $req->get_param('key'));
