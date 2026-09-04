@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.112
+ * Version: 1.16.114
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.112');
+define('FVC_BRIDGE_VERSION',    '1.16.114');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -458,33 +458,17 @@ add_action('wp_head', 'fvc_bridge_finder_css', 30);
 function fvc_bridge_finder_css() {
     if ( ! is_page('vancouver-clinic-finder') ) return;
     echo <<<'CSS'
-<style id="fvc-finder-dark">
-body .fvc-cf-widget-section.fvc-cf-widget-section{background:radial-gradient(1000px 480px at 12% -10%,rgba(9,189,184,.13),transparent 58%),#09090B !important;}
-.fvc-cf-widget-section .fvc-cf-form-panel{background:transparent !important;border:0 !important;box-shadow:none !important;}
-.fvc-cf-widget-section .fvc-cf-form-title{color:#fff !important;}
-.fvc-cf-widget-section .fvc-cf-form-sub{color:rgba(255,255,255,.55) !important;}
-.fvc-cf-widget-section .fvc-cf-dd-label,.fvc-cf-widget-section .fvc-cf-freetext-label,.fvc-cf-widget-section .fvc-cf-pref-label{color:#fff !important;}
-.fvc-cf-widget-section .fvc-cf-freetext-opt{color:rgba(255,255,255,.4) !important;}
-.fvc-cf-widget-section .fvc-cf-dd-trigger{background:transparent !important;border:0 !important;}
-.fvc-cf-widget-section .fvc-cf-dd-value{color:rgba(255,255,255,.9) !important;}
-.fvc-cf-widget-section .fvc-cf-dd-arrow{color:rgba(255,255,255,.5) !important;}
-.fvc-cf-widget-section .fvc-cf-dd-options{background:#15171a !important;border:1px solid rgba(255,255,255,.12) !important;}
-.fvc-cf-widget-section .fvc-cf-dd-option{color:rgba(255,255,255,.85) !important;}
-.fvc-cf-widget-section .fvc-cf-freetext-input{background:transparent !important;border:0 !important;color:#fff !important;}
-.fvc-cf-widget-section .fvc-cf-freetext-input::placeholder{color:rgba(255,255,255,.38) !important;}
-.fvc-cf-widget-section .fvc-cf-care-row,.fvc-cf-widget-section .fvc-cf-freetext-row,.fvc-cf-widget-section .fvc-cf-pref-row{border-color:rgba(255,255,255,.1) !important;}
-.fvc-cf-widget-section .fvc-cf-chip{background:transparent !important;border:1px solid rgba(255,255,255,.2) !important;color:rgba(255,255,255,.85) !important;}
-.fvc-cf-widget-section .fvc-cf-submit{background:#09BDB8 !important;color:#fff !important;border:0 !important;}
-.fvc-cf-widget-section .fvc-cf-submit.fvc-cf-disabled{background:rgba(255,255,255,.1) !important;color:rgba(255,255,255,.38) !important;opacity:1 !important;}
-.fvc-cf-widget-section .fvc-cf-results-empty-label,.fvc-cf-widget-section .fvc-cf-results-intro,.fvc-cf-widget-section .fvc-cf-match-count,.fvc-cf-widget-section .fvc-cf-summary-label{color:rgba(255,255,255,.6) !important;}
-.fvc-cf-widget-section .fvc-iw-clinic-card{background:#141619 !important;border:1px solid rgba(255,255,255,.08) !important;border-radius:12px !important;padding:18px 20px !important;margin-bottom:14px !important;}
-.fvc-cf-widget-section .fvc-iw-clinic-name{color:#fff !important;}
-.fvc-cf-widget-section .fvc-iw-clinic-name:hover{color:#2fd4cf !important;}
-.fvc-cf-widget-section .fvc-iw-clinic-btn{color:#2fd4cf !important;}
-.fvc-cf-widget-section .fvc-iw-clinic-blurb{color:rgba(255,255,255,.62) !important;}
-.fvc-cf-widget-section .fvc-iw-badge{color:rgba(255,255,255,.7) !important;border:1px solid rgba(255,255,255,.18) !important;margin:0 6px 4px 0 !important;}
-.fvc-cf-widget-section .fvc-iw-rating{color:#f5b60a !important;}
-.fvc-cf-widget-section .fvc-iw-rating-count{color:rgba(255,255,255,.5) !important;}
+<style id="fvc-finder-light">
+/* Dark hero, light body: the form (.fvc-cf-widget-section) + FAQ are light natively, so we only
+   lighten the "how it works" band here; the hero stays dark. (Was previously a full dark override.) */
+body .fvc-cf-how{background:#f4f2ed !important;}
+body .fvc-cf-how-eyebrow{color:#0a8078 !important;}
+body .fvc-cf-how-h2,body .fvc-cf-how-header{color:#1d1d1f !important;}
+body .fvc-cf-step{background:#fff !important;border:1px solid rgba(9,9,11,.1) !important;box-shadow:0 2px 10px rgba(0,0,0,.05) !important;}
+body .fvc-cf-step-num{color:#0a8078 !important;}
+body .fvc-cf-step-tag{color:rgba(10,128,120,.7) !important;}
+body .fvc-cf-step-title{color:#1d1d1f !important;}
+body .fvc-cf-step-desc{color:#6e6e73 !important;}
 </style>
 <script>(function(){
   function inFinder(el){return el && el.closest && el.closest('.fvc-cf-widget-section');}
