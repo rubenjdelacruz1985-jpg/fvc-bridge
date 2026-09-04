@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.91
+ * Version: 1.16.92
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.91');
+define('FVC_BRIDGE_VERSION',    '1.16.92');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -2829,7 +2829,11 @@ add_action('wp_head', function () {
     }
 }, 6);
 function fvc_bridge_is_places_archive() { return function_exists('is_post_type_archive') && is_post_type_archive('gd_place') && ! is_tax() && ! is_singular(); }
-add_filter('rank_math/frontend/title', function ($t) { return fvc_bridge_is_places_archive() ? 'Find & Compare Vancouver Health Clinics | Physio, Chiro, RMT, Naturopath & Acupuncture' : $t; }, 20);
+add_filter('rank_math/frontend/title', function ($t) {
+    // Lead the homepage title with the brand so Google shows "Find Vancouver Clinics" as the site name (not the domain).
+    if ( is_front_page() || is_home() ) return 'Find Vancouver Clinics — Physiotherapy, Chiropractic, Massage, Naturopath & Acupuncture';
+    return fvc_bridge_is_places_archive() ? 'Find & Compare Vancouver Health Clinics | Physio, Chiro, RMT, Naturopath & Acupuncture' : $t;
+}, 20);
 add_filter('rank_math/frontend/description', function ($d) { return fvc_bridge_is_places_archive() ? 'Browse and compare physiotherapy, chiropractic, massage therapy, naturopathic and acupuncture clinics across Vancouver — by neighbourhood, Google rating, ICBC direct billing and online booking.' : $d; }, 20);
 function fvc_bridge_rest_booking_run_reminders($req) {
     return new WP_REST_Response(array('ok' => true, 'sent' => fvc_bridge_booking_send_reminders()), 200);
