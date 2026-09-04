@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.98
+ * Version: 1.16.100
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.98');
+define('FVC_BRIDGE_VERSION',    '1.16.100');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -536,8 +536,10 @@ CSS;
 
 // Read a page's Elementor data by slug — lets the bridge inspect/edit native page content.
 function fvc_bridge_rest_page_elementor_get($req) {
+    // Accept id (any post type incl. elementor_library templates) OR slug (pages).
+    $id = absint($req->get_param('id'));
     $slug = sanitize_title($req->get_param('slug'));
-    $p = $slug ? get_page_by_path($slug, OBJECT, 'page') : null;
+    $p = $id ? get_post($id) : ($slug ? get_page_by_path($slug, OBJECT, 'page') : null);
     if (!$p) return new WP_REST_Response(array('ok'=>false,'error'=>'page not found'), 404);
     $data = get_post_meta($p->ID, '_elementor_data', true);
     return new WP_REST_Response(array(
@@ -552,8 +554,10 @@ function fvc_bridge_rest_page_elementor_get($req) {
 // Write a page's Elementor data back. _elementor_data is stored SLASHED (Elementor convention);
 // update_metadata unslashes, so pass wp_slash($json). Then bust Elementor's cached CSS.
 function fvc_bridge_rest_page_elementor_save($req) {
+    // Accept id (any post type incl. elementor_library templates) OR slug (pages).
+    $id = absint($req->get_param('id'));
     $slug = sanitize_title($req->get_param('slug'));
-    $p = $slug ? get_page_by_path($slug, OBJECT, 'page') : null;
+    $p = $id ? get_post($id) : ($slug ? get_page_by_path($slug, OBJECT, 'page') : null);
     if (!$p) return new WP_REST_Response(array('ok'=>false,'error'=>'page not found'), 404);
     // Data is sent base64-encoded so REST/WP slash handling can't mangle the JSON in transit.
     $b64 = $req->get_param('data_b64');
@@ -1018,6 +1022,86 @@ function fvc_bridge_nav_categories() {
     foreach ( $terms as $t ) { if ( ! isset($used[$t->slug]) ) { $link = get_term_link($t); $out[] = array('n' => $t->name, 'h' => is_wp_error($link) ? '' : parse_url($link, PHP_URL_PATH), 'd' => ''); } }
     return array_values(array_filter($out, function ($c) { return ! empty($c['h']); }));
 }
+// Category-specific archive hero. The GeoDirectory archive template (Elementor 431) renders ONE
+// generic hero ("Find a Health Clinic in Vancouver", 5 specialities, 5 category pills, "All Services"
+// breadcrumb) for every category. This makes it reflect the actual category + real category count.
+function fvc_bridge_category_hero_copy() {
+    return array(
+        'physiotherapy-vancouver' => array('Physiotherapy', 'Compare physiotherapy clinics across Vancouver — ICBC direct billing, Google ratings and easy online booking.'),
+        'chiropractor-vancouver'  => array('Chiropractors', 'Compare chiropractors across Vancouver by Google rating, neighbourhood, ICBC billing and online booking.'),
+        'massage-therapy-vancouver' => array('Massage Therapy', 'Find registered massage therapists (RMT) across Vancouver — direct billing, ratings and online booking.'),
+        'naturopath-vancouver'    => array('Naturopaths', 'Compare naturopathic doctors across Vancouver by focus, Google rating and neighbourhood.'),
+        'acupuncture-vancouver'   => array('Acupuncture', 'Find acupuncturists and TCM clinics across Vancouver by rating, neighbourhood and billing options.'),
+        'counselling-vancouver'   => array('Counselling & Therapy', 'Compare registered clinical counsellors, therapists and psychologists across Vancouver by approach, rating and neighbourhood.'),
+        'kinesiology-vancouver'   => array('Kinesiology', 'Find kinesiologists and active-rehab clinics across Vancouver for injury recovery, ICBC active rehab and return to sport.'),
+        'podiatry-vancouver'      => array('Podiatry', 'Find podiatrists and foot-care clinics across Vancouver for heel pain, orthotics, sports injuries and diabetic foot care.'),
+        'dietitian-vancouver'     => array('Dietitians', 'Compare registered dietitians and nutrition clinics across Vancouver for gut health, diabetes, weight and sports nutrition.'),
+    );
+}
+add_action('wp_footer', 'fvc_bridge_archive_hero', 96);
+function fvc_bridge_archive_hero() {
+    if ( fvc_bridge_is_standalone() ) return;
+    $isCat  = function_exists('is_tax') && is_tax('gd_placecategory');
+    $isArch = function_exists('is_post_type_archive') && is_post_type_archive('gd_place');
+    if ( ! $isCat && ! $isArch ) return;
+    $h1 = ''; $catName = '';
+    $desc = 'Browse and compare physiotherapy, chiropractic, massage, counselling and more across Vancouver and the Lower Mainland.';
+    if ( $isCat ) {
+        $term = get_queried_object();
+        if ( $term && ! is_wp_error($term) ) {
+            $catName = $term->name;
+            $map = fvc_bridge_category_hero_copy();
+            if ( isset($map[$term->slug]) ) { $h1 = $map[$term->slug][0]; $desc = $map[$term->slug][1]; }
+            else { $h1 = $term->name; $desc = 'Compare ' . strtolower($term->name) . ' clinics across Vancouver by Google rating, neighbourhood and billing options.'; }
+        }
+    }
+    $cats = fvc_bridge_nav_categories();
+    $data = array('isCat' => $isCat, 'h1' => $h1, 'desc' => $desc, 'catName' => $catName, 'cats' => $cats, 'count' => count($cats));
+    echo '<script>window.FVC_ARCHIVE=' . wp_json_encode($data) . ';</script>' . "\n";
+    echo <<<'HTML'
+<script>(function(){
+  var A=window.FVC_ARCHIVE; if(!A) return;
+  function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+  function run(){
+    // "Specialities" stat -> real category count
+    document.querySelectorAll('.fvc-hero-stat').forEach(function(s){
+      var l=s.querySelector('.fvc-hero-stat-label'), n=s.querySelector('.fvc-hero-stat-num');
+      if(l&&n&&/special/i.test(l.textContent)) n.textContent=A.count;
+    });
+    // category pills: make sure every category is present in each pill row
+    document.querySelectorAll('.fvc-hero-pills-bar,.fvc-hero-pills-scroll').forEach(function(wrap){
+      var pills=wrap.querySelectorAll(':scope > .fvc-hero-pill-new'); if(!pills.length) return;
+      var have={}; pills.forEach(function(p){have[(p.textContent||'').trim().toLowerCase()]=1;});
+      var anchor=pills[pills.length-1];
+      A.cats.forEach(function(c){ var k=c.n.toLowerCase(); if(have[k]) return;
+        var node=anchor.cloneNode(true); if(c.h) node.setAttribute('href',c.h);
+        var dot=node.querySelector('.fvc-hero-pill-dot-new'); node.textContent='';
+        if(dot) node.appendChild(dot); node.appendChild(document.createTextNode(c.n));
+        anchor.parentNode.insertBefore(node, anchor.nextSibling); anchor=node; have[k]=1;
+      });
+    });
+    // description (both category + all-clinics)
+    var d=document.querySelector('.fvc-hero-desc'); if(d&&A.desc) d.textContent=A.desc;
+    if(A.isCat){
+      var h1=document.querySelector('.fvc-hero-h1');
+      if(h1&&A.h1) h1.innerHTML=esc(A.h1)+'<br class="fvc-hero-br"> <span class="fvc-hero-h1-accent">in Vancouver</span>';
+      var bc=document.querySelector('.fvc-hero-breadcrumb-current'); if(bc&&A.catName) bc.textContent=A.catName;
+      if(A.h1) document.title=document.title; // leave Rank Math title as-is
+    }
+  }
+  if(document.readyState!=='loading')run();else document.addEventListener('DOMContentLoaded',run);
+})();</script>
+HTML;
+}
+// Blog was paginating at ~10/page, so most posts sat on page 2 and looked "missing".
+// Show more per page on the posts index so the whole library is visible at once.
+add_action('pre_get_posts', 'fvc_bridge_blog_posts_per_page');
+function fvc_bridge_blog_posts_per_page($q) {
+    if ( is_admin() || ! $q->is_main_query() ) return;
+    if ( $q->is_home() || $q->is_category() || $q->is_tag() || ( $q->is_archive() && $q->get('post_type') === 'post' ) ) {
+        $q->set('posts_per_page', 30);
+    }
+}
 add_action('wp_head', 'fvc_bridge_header_css', 31);
 function fvc_bridge_header_css() {
     if ( fvc_bridge_is_standalone() ) return;
@@ -1063,10 +1147,10 @@ function fvc_bridge_header_css() {
 #fvcMobileMenu .fvc-mobile-section-label{font-size:10.5px!important;font-weight:700!important;letter-spacing:.8px!important;text-transform:uppercase!important;color:rgba(255,255,255,.38)!important;margin:13px 0 3px!important;display:block!important;}
 #fvcMobileMenu>a{display:block!important;padding:9px 2px!important;font-size:15px!important;font-weight:500!important;color:rgba(255,255,255,.84)!important;border-bottom:1px solid rgba(255,255,255,.07)!important;transition:color .12s!important;}
 #fvcMobileMenu>a:hover,#fvcMobileMenu>a:active{color:#4fe8e3!important;}
-#fvcMobileMenu .fvc-mm-grid{display:grid!important;grid-template-columns:1fr 1fr!important;gap:6px!important;margin:3px 0 2px!important;}
-#fvcMobileMenu .fvc-mm-grid a{display:flex!important;align-items:center!important;justify-content:center!important;text-align:center!important;min-height:46px!important;padding:10px!important;border:1px solid rgba(255,255,255,.1)!important;border-radius:8px!important;background:rgba(255,255,255,.03)!important;}
-#fvcMobileMenu .fvc-mm-grid a:active{background:rgba(255,255,255,.07)!important;}
-#fvcMobileMenu .fvc-dm-n{font-size:14px!important;font-weight:600!important;color:#fff!important;}
+#fvcMobileMenu .fvc-mm-grid{display:grid!important;grid-template-columns:1fr 1fr!important;gap:0 22px!important;margin:2px 0 4px!important;}
+#fvcMobileMenu .fvc-mm-grid a{display:block!important;padding:12px 2px!important;border:0!important;border-radius:0!important;background:transparent!important;border-bottom:1px solid rgba(255,255,255,.07)!important;text-align:left!important;}
+#fvcMobileMenu .fvc-mm-grid a:active{color:#4fe8e3!important;}
+#fvcMobileMenu .fvc-dm-n{font-size:15px!important;font-weight:500!important;color:rgba(255,255,255,.85)!important;}
 #fvcMobileMenu .fvc-dm-d{font-size:11px!important;font-weight:400!important;color:rgba(255,255,255,.45)!important;line-height:1.3!important;}
 #fvcMobileMenu>a.fvc-mm-ai{font-weight:600!important;color:#fff!important;}
 #fvcMobileMenu .fvc-mobile-divider{display:none!important;}
