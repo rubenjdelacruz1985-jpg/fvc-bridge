@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.83
+ * Version: 1.16.84
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.83');
+define('FVC_BRIDGE_VERSION',    '1.16.84');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -220,6 +220,9 @@ add_action('rest_api_init', function () {
     register_rest_route('fvc-bridge/v1', '/booking-run-reminders', array('methods'=>'POST','permission_callback'=>function(){return fvc_bridge_has_valid_token()||current_user_can('manage_options');},'callback'=>'fvc_bridge_rest_booking_run_reminders'));
     register_rest_route('fvc-bridge/v1', '/booking-appt', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_appt'));
     register_rest_route('fvc-bridge/v1', '/booking-reschedule', array('methods'=>'POST','permission_callback'=>'fvc_bridge_require_token_or_public','callback'=>'fvc_bridge_rest_booking_reschedule'));
+    register_rest_route('fvc-bridge/v1', '/stripe-platform-config', array('methods'=>array('GET','POST'),'permission_callback'=>function(){return fvc_bridge_has_valid_token()||current_user_can('manage_options');},'callback'=>'fvc_bridge_rest_stripe_platform_config'));
+    register_rest_route('fvc-bridge/v1', '/booking-connect-start', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_connect_start'));
+    register_rest_route('fvc-bridge/v1', '/booking-connect-status', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_booking_connect_status'));
     register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
     // Public read: a clinic's listing data, formatted to seed the site builder.
     register_rest_route('fvc-bridge/v1', '/clinic-data', array(
@@ -1993,7 +1996,7 @@ function fvc_bridge_booking_table() { global $wpdb; return $wpdb->prefix . 'fvc_
 function fvc_bridge_booking_ensure_table() {
     global $wpdb;
     $t = fvc_bridge_booking_table();
-    if ( get_option('fvc_bridge_booking_db') === '4' ) return;
+    if ( get_option('fvc_bridge_booking_db') === '5' ) return;
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     $charset = $wpdb->get_charset_collate();
     dbDelta("CREATE TABLE $t (
@@ -2016,12 +2019,13 @@ function fvc_bridge_booking_ensure_table() {
         refunded TINYINT DEFAULT 0,
         reminded TINYINT DEFAULT 0,
         intake TEXT,
+        stripe_acct VARCHAR(40) DEFAULT '',
         created_at DATETIME NOT NULL,
         PRIMARY KEY (id),
         KEY listing_id (listing_id),
         KEY start_local (start_local)
     ) $charset;");
-    update_option('fvc_bridge_booking_db', '4');
+    update_option('fvc_bridge_booking_db', '5');
 }
 
 function fvc_bridge_booking_defaults($listing_id) {
@@ -2079,7 +2083,7 @@ function fvc_bridge_rest_booking_config($req) {
     $cfg = fvc_bridge_booking_get_config($id);
     // never expose stored secret key to the public endpoint (it lives in a separate meta anyway)
     if ( isset($cfg['pay']['sk']) ) unset($cfg['pay']['sk']);
-    $cfg['payConfigured'] = fvc_bridge_booking_secret($id) !== '' && ($cfg['pay']['mode'] ?? 'off') !== 'off';
+    $cfg['payConfigured'] = fvc_bridge_booking_pay_creds($id)['mode'] !== 'none' && ($cfg['pay']['mode'] ?? 'off') !== 'off';
     $cfg['ok'] = true; $cfg['listingId'] = $id; $cfg['clinic'] = html_entity_decode($p->post_title, ENT_QUOTES);
     return new WP_REST_Response($cfg, 200);
 }
@@ -2090,7 +2094,50 @@ function fvc_bridge_rest_booking_config_admin($req) {
     $cfg = fvc_bridge_booking_get_config($id);
     if ( isset($cfg['pay']['sk']) ) unset($cfg['pay']['sk']);
     $cfg['ok'] = true; $cfg['listingId'] = $id; $cfg['hasSecret'] = fvc_bridge_booking_secret($id) !== '';
+    $cfg['connect'] = array('platformOn' => fvc_bridge_stripe_platform_sk() !== '', 'acct' => fvc_bridge_stripe_connect_acct($id), 'feePct' => fvc_bridge_stripe_platform_fee_pct());
     return new WP_REST_Response($cfg, 200);
+}
+
+// ---- Stripe Connect onboarding (Express accounts + Account Links) ----
+function fvc_bridge_rest_stripe_platform_config($req) {
+    if ( $req->get_method() === 'GET' ) {
+        return new WP_REST_Response(array('ok' => true, 'configured' => fvc_bridge_stripe_platform_sk() !== '', 'feePct' => fvc_bridge_stripe_platform_fee_pct()), 200);
+    }
+    $b = $req->get_json_params();
+    if ( isset($b['sk']) ) { $sk = trim((string) $b['sk']); if ( $sk === '__clear__' ) delete_option('fvc_stripe_platform_sk'); elseif ( $sk !== '' && strpos($sk, '••') === false ) update_option('fvc_stripe_platform_sk', $sk); }
+    if ( isset($b['feePct']) ) update_option('fvc_stripe_platform_fee_pct', max(0, min(100, (float) $b['feePct'])));
+    return new WP_REST_Response(array('ok' => true, 'configured' => fvc_bridge_stripe_platform_sk() !== '', 'feePct' => fvc_bridge_stripe_platform_fee_pct()), 200);
+}
+function fvc_bridge_rest_booking_connect_start($req) {
+    $id = (int) $req->get_param('listing');
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $psk = fvc_bridge_stripe_platform_sk();
+    if ( ! $psk ) return new WP_REST_Response(array('ok' => false, 'error' => 'Platform payments aren\'t set up yet.'), 400);
+    $acct = fvc_bridge_stripe_connect_acct($id);
+    if ( ! $acct ) {
+        $owner = get_userdata((int) get_post_field('post_author', $id));
+        $email = $owner && is_email($owner->user_email) ? $owner->user_email : '';
+        $a = fvc_bridge_stripe_api($psk, 'POST', 'accounts', array_filter(array(
+            'type' => 'express', 'country' => 'CA', 'email' => $email,
+            'business_type' => 'company', 'capabilities[card_payments][requested]' => 'true', 'capabilities[transfers][requested]' => 'true',
+        )));
+        if ( empty($a['id']) ) return new WP_REST_Response(array('ok' => false, 'error' => isset($a['error']['message']) ? $a['error']['message'] : 'Could not start onboarding.'), 502);
+        $acct = $a['id']; update_post_meta($id, '_fvc_stripe_acct', $acct);
+    }
+    $ret = home_url('/clinic-calendar/?connect=done'); $ref = home_url('/clinic-calendar/?connect=refresh');
+    $link = fvc_bridge_stripe_api($psk, 'POST', 'account_links', array('account' => $acct, 'refresh_url' => $ref, 'return_url' => $ret, 'type' => 'account_onboarding'));
+    if ( empty($link['url']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'Could not create onboarding link.'), 502);
+    return new WP_REST_Response(array('ok' => true, 'url' => $link['url']), 200);
+}
+function fvc_bridge_rest_booking_connect_status($req) {
+    $id = (int) $req->get_param('listing');
+    if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    $psk = fvc_bridge_stripe_platform_sk(); $acct = fvc_bridge_stripe_connect_acct($id);
+    if ( ! $psk ) return new WP_REST_Response(array('ok' => true, 'platformOn' => false, 'connected' => false), 200);
+    if ( ! $acct ) return new WP_REST_Response(array('ok' => true, 'platformOn' => true, 'connected' => false, 'chargesEnabled' => false), 200);
+    $a = fvc_bridge_stripe_api($psk, 'GET', 'accounts/' . rawurlencode($acct));
+    return new WP_REST_Response(array('ok' => true, 'platformOn' => true, 'connected' => true, 'acct' => $acct,
+        'chargesEnabled' => ! empty($a['charges_enabled']), 'detailsSubmitted' => ! empty($a['details_submitted']), 'feePct' => fvc_bridge_stripe_platform_fee_pct()), 200);
 }
 function fvc_bridge_rest_booking_config_save($req) {
     $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
@@ -2206,12 +2253,12 @@ function fvc_bridge_booking_ics($appt, $cfg) {
         . "STATUS:CONFIRMED\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
 }
 
-// ---- Stripe (per-clinic direct charges; secret key from _fvc_booking_sk) ----
-function fvc_bridge_stripe_api($sk, $method, $path, $params = array()) {
+// ---- Stripe (per-clinic direct charges OR platform Connect via $account header) ----
+function fvc_bridge_stripe_api($sk, $method, $path, $params = array(), $account = '') {
     $url = 'https://api.stripe.com/v1/' . $path;
-    $args = array('method' => $method, 'timeout' => 25, 'headers' => array(
-        'Authorization' => 'Bearer ' . $sk, 'Content-Type' => 'application/x-www-form-urlencoded', 'Stripe-Version' => '2024-06-20',
-    ));
+    $headers = array('Authorization' => 'Bearer ' . $sk, 'Content-Type' => 'application/x-www-form-urlencoded', 'Stripe-Version' => '2024-06-20');
+    if ( $account ) $headers['Stripe-Account'] = $account; // act on behalf of a connected account (direct charge)
+    $args = array('method' => $method, 'timeout' => 25, 'headers' => $headers);
     if ( $method === 'GET' ) { if ( $params ) $url = add_query_arg(array_map('urlencode', $params), $url); }
     else { $args['body'] = http_build_query($params); }
     $res = wp_remote_request($url, $args);
@@ -2220,6 +2267,18 @@ function fvc_bridge_stripe_api($sk, $method, $path, $params = array()) {
     if ( ! is_array($body) ) $body = array();
     $body['_status'] = (int) wp_remote_retrieve_response_code($res);
     return $body;
+}
+// Platform Connect config (set once by the platform owner). Secret lives in wp options, never in code.
+function fvc_bridge_stripe_platform_sk() { return (string) get_option('fvc_stripe_platform_sk', ''); }
+function fvc_bridge_stripe_platform_fee_pct() { return (float) get_option('fvc_stripe_platform_fee_pct', 0); }
+function fvc_bridge_stripe_connect_acct($listing_id) { return (string) get_post_meta($listing_id, '_fvc_stripe_acct', true); }
+// Resolve which credentials a clinic's payments use: Connect (platform sk + connected acct) preferred, else the clinic's own key.
+function fvc_bridge_booking_pay_creds($listing_id) {
+    $acct = fvc_bridge_stripe_connect_acct($listing_id); $psk = fvc_bridge_stripe_platform_sk();
+    if ( $acct && $psk ) return array('sk' => $psk, 'account' => $acct, 'mode' => 'connect');
+    $sk = fvc_bridge_booking_secret($listing_id);
+    if ( $sk ) return array('sk' => $sk, 'account' => '', 'mode' => 'direct');
+    return array('sk' => '', 'account' => '', 'mode' => 'none');
 }
 function fvc_bridge_money($cents, $cur) { return '$' . number_format(((int) $cents) / 100, 2) . ' ' . strtoupper($cur); }
 
@@ -2329,14 +2388,15 @@ function fvc_bridge_rest_booking_create($req) {
     $key = wp_generate_password(24, false);
     $cfg['clinic'] = html_entity_decode($p->post_title, ENT_QUOTES);
     $amount = fvc_bridge_booking_amount_cents($cfg, $svc);
-    $sk = fvc_bridge_booking_secret($id);
-    $needPay = ( $amount > 0 && $sk !== '' );
+    $creds = fvc_bridge_booking_pay_creds($id);
+    $needPay = ( $amount > 0 && $creds['mode'] !== 'none' );
     $cur = $cfg['pay']['currency'] ?? 'cad';
     $wpdb->insert($t, array(
         'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
         'start_local' => $s, 'end_local' => $e, 'name' => $name, 'email' => $email, 'phone' => $phone,
         'notes' => $notes, 'status' => $needPay ? 'awaiting_payment' : 'pending', 'manage_key' => $key,
-        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'intake' => $intakeJson, 'created_at' => current_time('mysql'),
+        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'intake' => $intakeJson,
+        'stripe_acct' => $needPay ? $creds['account'] : '', 'created_at' => current_time('mysql'),
     ));
     $aid = (int) $wpdb->insert_id;
     $appt = array('id' => $aid, 'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
@@ -2350,7 +2410,7 @@ function fvc_bridge_rest_booking_create($req) {
         $label = ($cfg['pay']['mode'] === 'full' ? 'Payment' : 'Deposit') . ' · ' . ($svc ?: 'Appointment') . ' · ' . $cfg['clinic'];
         $success = add_query_arg(array('clinic' => $id, 'paid' => 1, 'appt' => $aid, 'k' => $key), home_url('/book/'));
         $cancel  = add_query_arg(array('clinic' => $id, 'cancelled' => 1), home_url('/book/'));
-        $sess = fvc_bridge_stripe_api($sk, 'POST', 'checkout/sessions', array(
+        $params = array(
             'mode' => 'payment', 'success_url' => $success, 'cancel_url' => $cancel,
             'client_reference_id' => (string) $aid, 'customer_email' => $email,
             'line_items[0][quantity]' => 1,
@@ -2360,7 +2420,12 @@ function fvc_bridge_rest_booking_create($req) {
             'payment_intent_data[metadata][appt]' => (string) $aid,
             'payment_intent_data[metadata][listing]' => (string) $id,
             'metadata[appt]' => (string) $aid,
-        ));
+        );
+        if ( $creds['mode'] === 'connect' ) {
+            $fee = (int) round($amount * fvc_bridge_stripe_platform_fee_pct() / 100);
+            if ( $fee > 0 ) $params['payment_intent_data[application_fee_amount]'] = $fee;
+        }
+        $sess = fvc_bridge_stripe_api($creds['sk'], 'POST', 'checkout/sessions', $params, $creds['account']);
         if ( empty($sess['url']) || empty($sess['id']) ) {
             $wpdb->delete($t, array('id' => $aid)); // release the held slot
             $msg = isset($sess['error']['message']) ? $sess['error']['message'] : 'Could not start payment — please try again.';
@@ -2389,9 +2454,10 @@ function fvc_bridge_rest_booking_verify_payment($req) {
     $manageUrl = add_query_arg(array('appt' => $aid, 'key' => $key), home_url('/booking-manage/'));
     $icsUrl = add_query_arg(array('appt' => $aid, 'key' => $key), rest_url('fvc-bridge/v1/booking-ics'));
     if ( (int) $row['paid'] === 1 ) return new WP_REST_Response(array('ok' => true, 'paid' => true, 'when' => $when, 'manageUrl' => $manageUrl, 'icsUrl' => $icsUrl), 200);
-    $sk = fvc_bridge_booking_secret((int) $row['listing_id']);
+    $acct = $row['stripe_acct'] ?? '';
+    $sk = $acct ? fvc_bridge_stripe_platform_sk() : fvc_bridge_booking_secret((int) $row['listing_id']);
     if ( ! $sk || ! $row['stripe_session'] ) return new WP_REST_Response(array('ok' => false, 'error' => 'no payment on file'), 400);
-    $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($row['stripe_session']));
+    $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($row['stripe_session']), array(), $acct);
     if ( ($sess['payment_status'] ?? '') !== 'paid' ) return new WP_REST_Response(array('ok' => false, 'pending' => true, 'error' => 'Payment not completed yet.'), 200);
     $wpdb->update($t, array('paid' => 1, 'status' => 'pending'), array('id' => $aid));
     $appt = $row; $appt['status'] = 'pending';
@@ -2410,9 +2476,10 @@ function fvc_bridge_rest_booking_webhook($req) {
     $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $aid), ARRAY_A);
     if ( ! $row ) return new WP_REST_Response(array('ok' => true, 'ignored' => true), 200);
     // confirm the session id matches and payment is paid (re-check via API using the clinic secret)
-    $sk = fvc_bridge_booking_secret((int) $row['listing_id']);
+    $acct = $row['stripe_acct'] ?? '';
+    $sk = $acct ? fvc_bridge_stripe_platform_sk() : fvc_bridge_booking_secret((int) $row['listing_id']);
     if ( $sk && ! empty($obj['id']) && $row['stripe_session'] === $obj['id'] && (int) $row['paid'] !== 1 ) {
-        $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($obj['id']));
+        $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($obj['id']), array(), $acct);
         if ( ($sess['payment_status'] ?? '') === 'paid' ) {
             $wpdb->update($t, array('paid' => 1, 'status' => 'pending'), array('id' => $aid));
             $cfg = fvc_bridge_booking_get_config((int) $row['listing_id']);
@@ -2461,12 +2528,15 @@ function fvc_bridge_rest_booking_status($req) {
     $refunded = false;
     // refund a paid deposit when an appointment is cancelled (best-effort)
     if ( $status === 'cancelled' && (int) $row['paid'] === 1 && (int) $row['refunded'] !== 1 && $row['stripe_session'] ) {
-        $sk = fvc_bridge_booking_secret((int) $row['listing_id']);
+        $acct = $row['stripe_acct'] ?? '';
+        $sk = $acct ? fvc_bridge_stripe_platform_sk() : fvc_bridge_booking_secret((int) $row['listing_id']);
         if ( $sk ) {
-            $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($row['stripe_session']));
+            $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($row['stripe_session']), array(), $acct);
             $pi = $sess['payment_intent'] ?? '';
             if ( $pi ) {
-                $r = fvc_bridge_stripe_api($sk, 'POST', 'refunds', array('payment_intent' => $pi));
+                $rp = array('payment_intent' => $pi);
+                if ( $acct ) $rp['refund_application_fee'] = 'true'; // give the platform fee back too
+                $r = fvc_bridge_stripe_api($sk, 'POST', 'refunds', $rp, $acct);
                 if ( ! empty($r['id']) ) { $wpdb->update($t, array('refunded' => 1), array('id' => $aid)); $refunded = true; }
             }
         }
