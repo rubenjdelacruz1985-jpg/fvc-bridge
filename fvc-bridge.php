@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.129
+ * Version: 1.16.131
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.129');
+define('FVC_BRIDGE_VERSION',    '1.16.131');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1602,6 +1602,25 @@ body.post-type-archive-gd_place .fvc-card-service-tag ~ .fvc-card-service-tag ~ 
   body.geodir-archive .fvc-hero{padding-top:74px !important;padding-bottom:20px !important;}
   body .fvc-cat-stats{margin-top:12px !important;}
   body .fvc-hero-guide{margin-top:10px !important;}
+}
+</style>
+HTML;
+}
+
+// Mobile scroll performance: drop backdrop-filter (blur) on the fixed nav, the scroll-top FAB
+// and the mobile menu. A fixed blurred bar re-blurs everything behind it every frame, which
+// janks scrolling on phones — worst near the footer, where the scroll-top button adds a 2nd
+// live blur layer. Solid backgrounds look nearly identical (nav is already 80% opaque, the menu
+// 98%) and composite cheaply. Desktop keeps the glass look.
+add_action('wp_head', 'fvc_bridge_mobile_perf', 36);
+function fvc_bridge_mobile_perf() {
+    echo <<<'HTML'
+<style id="fvc-mobile-perf">
+@media (max-width:900px){
+  body #fvcNavWrap{-webkit-backdrop-filter:none !important;backdrop-filter:none !important;background:rgba(9,9,11,.97) !important;}
+  body button#fvc-scroll-top,body #fvc-scroll-top{-webkit-backdrop-filter:none !important;backdrop-filter:none !important;background:rgba(14,15,18,.92) !important;}
+  body #fvcMobileMenu{-webkit-backdrop-filter:none !important;backdrop-filter:none !important;background:#09090b !important;}
+  body #fvcDropMenu{-webkit-backdrop-filter:none !important;backdrop-filter:none !important;}
 }
 </style>
 HTML;
