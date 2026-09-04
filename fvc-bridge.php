@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.106
+ * Version: 1.16.107
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.106');
+define('FVC_BRIDGE_VERSION',    '1.16.107');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1195,13 +1195,28 @@ function fvc_bridge_category_hero_copy() {
         'dietitian-vancouver'     => array('Dietitians', 'Compare registered dietitians and nutrition clinics across Vancouver for gut health, diabetes, weight and sports nutrition.'),
     );
 }
+// Best guide (blog post) per category — links the archive to its guide to form a topic cluster
+// (the guides link out to the archives; this links the archives back, so neither is orphaned).
+function fvc_bridge_category_guide() {
+    return array(
+        'physiotherapy-vancouver'   => array('physiotherapy-cost-vancouver', 'What physiotherapy costs in Vancouver'),
+        'chiropractor-vancouver'    => array('chiropractor-vancouver-care-and-cost', 'Chiropractic care & costs, explained'),
+        'massage-therapy-vancouver' => array('massage-therapy-stress-tension-headaches', 'Massage for stress, tension & headaches'),
+        'naturopath-vancouver'      => array('naturopath-vancouver-what-to-expect', 'What a naturopath treats'),
+        'acupuncture-vancouver'     => array('acupuncture-vancouver-what-it-helps', 'What acupuncture helps with'),
+        'counselling-vancouver'     => array('how-to-find-a-counsellor-therapist-vancouver', 'How to find the right counsellor'),
+        'kinesiology-vancouver'     => array('kinesiology-active-rehab-vancouver', 'Kinesiology & active rehab, explained'),
+        'podiatry-vancouver'        => array('podiatrist-vancouver-foot-pain', 'When to see a podiatrist'),
+        'dietitian-vancouver'       => array('registered-dietitian-vancouver', 'Seeing a dietitian: what to expect'),
+    );
+}
 add_action('wp_footer', 'fvc_bridge_archive_hero', 96);
 function fvc_bridge_archive_hero() {
     if ( fvc_bridge_is_standalone() ) return;
     $isCat  = function_exists('is_tax') && is_tax('gd_placecategory');
     $isArch = function_exists('is_post_type_archive') && is_post_type_archive('gd_place');
     if ( ! $isCat && ! $isArch ) return;
-    $h1 = ''; $catName = '';
+    $h1 = ''; $catName = ''; $guide = null;
     $desc = 'Browse and compare physiotherapy, chiropractic, massage, counselling and more across Vancouver and the Lower Mainland.';
     if ( $isCat ) {
         $term = get_queried_object();
@@ -1210,12 +1225,18 @@ function fvc_bridge_archive_hero() {
             $map = fvc_bridge_category_hero_copy();
             if ( isset($map[$term->slug]) ) { $h1 = $map[$term->slug][0]; $desc = $map[$term->slug][1]; }
             else { $h1 = $term->name; $desc = 'Compare ' . strtolower($term->name) . ' clinics across Vancouver by Google rating, neighbourhood and billing options.'; }
+            $gmap = fvc_bridge_category_guide();
+            if ( isset($gmap[$term->slug]) ) $guide = array('url' => home_url('/' . $gmap[$term->slug][0] . '/'), 'label' => $gmap[$term->slug][1]);
         }
     }
     $cats = fvc_bridge_nav_categories();
-    $data = array('isCat' => $isCat, 'h1' => $h1, 'desc' => $desc, 'catName' => $catName, 'cats' => $cats, 'count' => count($cats));
+    $data = array('isCat' => $isCat, 'h1' => $h1, 'desc' => $desc, 'catName' => $catName, 'guide' => $guide, 'cats' => $cats, 'count' => count($cats));
     echo '<script>window.FVC_ARCHIVE=' . wp_json_encode($data) . ';</script>' . "\n";
     echo <<<'HTML'
+<style>
+body .fvc-hero-guide{display:inline-flex!important;align-items:center!important;gap:6px!important;margin-top:16px!important;color:#2fd4cf!important;font-weight:600!important;font-size:14.5px!important;text-decoration:none!important;transition:gap .14s,color .14s!important;}
+body .fvc-hero-guide:hover{color:#4fe8e3!important;gap:10px!important;}
+</style>
 <script>(function(){
   var A=window.FVC_ARCHIVE; if(!A) return;
   function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
@@ -1233,13 +1254,52 @@ function fvc_bridge_archive_hero() {
       var h1=document.querySelector('.fvc-hero-h1');
       if(h1&&A.h1) h1.innerHTML=esc(A.h1)+'<br class="fvc-hero-br"> <span class="fvc-hero-h1-accent">in Vancouver</span>';
       var bc=document.querySelector('.fvc-hero-breadcrumb-current'); if(bc&&A.catName) bc.textContent=A.catName;
-      if(A.h1) document.title=document.title; // leave Rank Math title as-is
+      // topic-cluster link: archive -> its guide (once)
+      if(A.guide&&d&&!document.querySelector('.fvc-hero-guide')){
+        var g=document.createElement('a'); g.className='fvc-hero-guide'; g.href=A.guide.url;
+        g.innerHTML='New here? '+esc(A.guide.label)+' <span aria-hidden="true">&rarr;</span>';
+        if(d.parentNode) d.parentNode.insertBefore(g, d.nextSibling);
+      }
     }
   }
   if(document.readyState!=='loading')run();else document.addEventListener('DOMContentLoaded',run);
 })();</script>
 HTML;
 }
+
+// BreadcrumbList JSON-LD for listings, category archives and blog posts (not otherwise output —
+// enables breadcrumb rich results in Google). Visual breadcrumbs already exist; this adds the schema.
+add_action('wp_head', 'fvc_bridge_breadcrumb_schema', 33);
+function fvc_bridge_breadcrumb_schema() {
+    if ( fvc_bridge_is_standalone() ) return;
+    $home = home_url('/');
+    $trail = array(); // [name, url]
+    if ( function_exists('is_singular') && is_singular('gd_place') ) {
+        $post = get_queried_object();
+        $trail[] = array('Home', $home);
+        $trail[] = array('Clinics', home_url('/places/'));
+        $cats = wp_get_post_terms($post->ID, 'gd_placecategory');
+        if ( ! is_wp_error($cats) && $cats ) { $l = get_term_link($cats[0]); if ( ! is_wp_error($l) ) $trail[] = array($cats[0]->name, $l); }
+        $trail[] = array(get_the_title($post), get_permalink($post));
+    } elseif ( function_exists('is_tax') && is_tax('gd_placecategory') ) {
+        $term = get_queried_object();
+        $trail[] = array('Home', $home);
+        $trail[] = array('Clinics', home_url('/places/'));
+        if ( $term && ! is_wp_error($term) ) { $l = get_term_link($term); $trail[] = array($term->name, is_wp_error($l) ? $home : $l); }
+    } elseif ( function_exists('is_singular') && is_singular('post') ) {
+        $post = get_queried_object();
+        $trail[] = array('Home', $home);
+        $trail[] = array('Blog', home_url('/blog/'));
+        $trail[] = array(get_the_title($post), get_permalink($post));
+    } else {
+        return;
+    }
+    if ( count($trail) < 2 ) return;
+    $items = array();
+    foreach ( $trail as $i => $t ) $items[] = array('@type' => 'ListItem', 'position' => $i + 1, 'name' => wp_strip_all_tags($t[0]), 'item' => $t[1]);
+    echo '<script type="application/ld+json">' . wp_json_encode(array('@context' => 'https://schema.org', '@type' => 'BreadcrumbList', 'itemListElement' => $items)) . '</script>' . "\n";
+}
+
 // Blog was paginating at ~10/page, so most posts sat on page 2 and looked "missing".
 // Show more per page on the posts index so the whole library is visible at once.
 add_action('pre_get_posts', 'fvc_bridge_blog_posts_per_page');
