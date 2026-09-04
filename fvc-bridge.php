@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.100
+ * Version: 1.16.103
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.100');
+define('FVC_BRIDGE_VERSION',    '1.16.103');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1022,6 +1022,170 @@ function fvc_bridge_nav_categories() {
     foreach ( $terms as $t ) { if ( ! isset($used[$t->slug]) ) { $link = get_term_link($t); $out[] = array('n' => $t->name, 'h' => is_wp_error($link) ? '' : parse_url($link, PHP_URL_PATH), 'd' => ''); } }
     return array_values(array_filter($out, function ($c) { return ! empty($c['h']); }));
 }
+/* ============================================================================
+ * Clinic filter — REBUILT (replaces the broken [fvc_sidebar_filter] WPCode
+ * shortcode whose area/insurance params returned 0 results). The new filter is
+ * a GET form; fvc_bridge_filter_clauses() applies the params to the archive
+ * query by joining the GeoDirectory detail table. Areas are the REAL
+ * neighbourhood values in the data, so every option returns results.
+ * ==========================================================================*/
+add_action('init', 'fvc_bridge_filter_init', 99);
+function fvc_bridge_filter_init() {
+    if ( shortcode_exists('fvc_sidebar_filter') ) remove_shortcode('fvc_sidebar_filter');
+    add_shortcode('fvc_sidebar_filter', 'fvc_bridge_render_filter');
+}
+// Distinct neighbourhoods that actually have clinics (slug => display name), cached per request.
+function fvc_bridge_filter_neighbourhoods() {
+    static $cache = null;
+    if ( $cache !== null ) return $cache;
+    global $wpdb;
+    $t = $wpdb->prefix . 'geodir_gd_place_detail';
+    $rows = $wpdb->get_col("SELECT neighbourhood, COUNT(*) c FROM {$t} WHERE neighbourhood <> '' GROUP BY neighbourhood HAVING c > 0 ORDER BY c DESC, neighbourhood ASC");
+    $out = array();
+    foreach ( (array) $rows as $n ) { $n = trim((string) $n); if ( $n === '' ) continue; $s = sanitize_title($n); if ( $s && ! isset($out[$s]) ) $out[$s] = $n; }
+    $cache = $out; return $out;
+}
+// Apply filter params to the gd_place archive / category query. We compute the matching post IDs
+// from a direct detail-table query and constrain via post__in — robust against GeoDirectory's own
+// query building, and it sidesteps GeoDirectory intercepting a location param (hence "hood", not "area").
+add_action('pre_get_posts', 'fvc_bridge_filter_query', 20);
+function fvc_bridge_filter_query($q) {
+    if ( is_admin() || ! $q->is_main_query() ) return;
+    if ( ! $q->is_post_type_archive('gd_place') && ! $q->is_tax('gd_placecategory') ) return;
+    global $wpdb;
+    $t = $wpdb->prefix . 'geodir_gd_place_detail';
+    $yes = "IN ('1','Yes','yes')";
+    $where = array();
+    if ( ! empty($_GET['icbc']) )     $where[] = "icbc_approved {$yes}";
+    if ( ! empty($_GET['worksafe']) ) $where[] = "_worksafebc_approved {$yes}";
+    if ( ! empty($_GET['billing']) )  $where[] = "direct_billing {$yes}";
+    if ( ! empty($_GET['booking']) )  $where[] = "online_booking_available {$yes}";
+    if ( ! empty($_GET['hood']) ) {
+        $map = fvc_bridge_filter_neighbourhoods();
+        $slug = sanitize_title(wp_unslash($_GET['hood']));
+        if ( isset($map[$slug]) ) $where[] = $wpdb->prepare("TRIM(neighbourhood) = %s", $map[$slug]);
+        else $where[] = '1=0';
+    }
+    $sort = isset($_GET['sort']) ? sanitize_key($_GET['sort']) : '';
+    $hasFilter = ! empty($where);
+    if ( ! $hasFilter && ! $sort ) return;
+    $order = '';
+    if ( $sort === 'rating' )       $order = "ORDER BY CAST(google_rating AS DECIMAL(3,2)) DESC, CAST(google_review_count AS UNSIGNED) DESC";
+    elseif ( $sort === 'reviews' )  $order = "ORDER BY CAST(google_review_count AS UNSIGNED) DESC";
+    if ( $hasFilter || $order ) {
+        $wsql = $where ? ( 'WHERE ' . implode(' AND ', $where) ) : '';
+        $ids = $wpdb->get_col("SELECT post_id FROM {$t} {$wsql} {$order}");
+        $ids = array_values(array_filter(array_map('intval', (array) $ids)));
+        if ( empty($ids) ) $ids = array(0);
+        $q->set('post__in', $ids);
+        if ( $order ) $q->set('orderby', 'post__in'); // preserve the rating / review order
+    }
+    if ( ! $order && $sort === 'name' ) { $q->set('orderby', 'title'); $q->set('order', 'ASC'); }
+}
+// Render the filter panel (used by the [fvc_sidebar_filter] shortcode in the archive template).
+function fvc_bridge_render_filter($atts = array()) {
+    $cats  = fvc_bridge_nav_categories();
+    $hoods = fvc_bridge_filter_neighbourhoods();
+    $cur   = get_queried_object();
+    $curCatHref = '';
+    if ( function_exists('is_tax') && is_tax('gd_placecategory') && $cur && ! is_wp_error($cur) ) {
+        $l = get_term_link($cur); $curCatHref = is_wp_error($l) ? '' : $l;
+    }
+    $action = $curCatHref ?: ( get_post_type_archive_link('gd_place') ?: home_url('/places/') );
+    $g = function ($k) { return isset($_GET[$k]) ? sanitize_text_field(wp_unslash($_GET[$k])) : ''; };
+    $areaSel = sanitize_title($g('hood'));
+    $sortSel = sanitize_key($g('sort'));
+    $ck = function ($k) { return ! empty($_GET[$k]) ? ' checked' : ''; };
+    $anyActive = ($areaSel || $sortSel || ! empty($_GET['icbc']) || ! empty($_GET['worksafe']) || ! empty($_GET['billing']) || ! empty($_GET['booking']));
+
+    ob_start();
+    ?>
+<div class="fvc-fbar" id="fvcFilter">
+  <button type="button" class="fvc-fbar-trigger" aria-expanded="false"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M7 12h10M10 18h4"/></svg> Filter clinics<?php if ($anyActive) echo ' <span class="fvc-fbar-dot"></span>'; ?></button>
+  <form class="fvc-fbar-panel" method="get" action="<?php echo esc_url($action); ?>">
+    <div class="fvc-fbar-head"><span class="fvc-fbar-title">Filter clinics</span><?php if ($anyActive): ?><a class="fvc-fbar-clear" href="<?php echo esc_url($action); ?>">Clear all</a><?php endif; ?><button type="button" class="fvc-fbar-close" aria-label="Close">&times;</button></div>
+
+    <div class="fvc-fbar-group">
+      <span class="fvc-fbar-label">Specialty</span>
+      <div class="fvc-fbar-cats">
+        <a class="fvc-fbar-cat<?php echo $curCatHref ? '' : ' is-on'; ?>" href="<?php echo esc_url(get_post_type_archive_link('gd_place') ?: home_url('/places/')); ?>">All clinics</a>
+        <?php foreach ($cats as $c) { $on = ($curCatHref && untrailingslashit($curCatHref) === untrailingslashit(home_url($c['h']))); echo '<a class="fvc-fbar-cat' . ($on ? ' is-on' : '') . '" href="' . esc_url($c['h']) . '">' . esc_html($c['n']) . '</a>'; } ?>
+      </div>
+    </div>
+
+    <div class="fvc-fbar-group">
+      <span class="fvc-fbar-label">Area</span>
+      <select class="fvc-fbar-select" name="hood">
+        <option value="">All of Vancouver</option>
+        <?php foreach ($hoods as $slug => $name) { echo '<option value="' . esc_attr($slug) . '"' . selected($areaSel, $slug, false) . '>' . esc_html($name) . '</option>'; } ?>
+      </select>
+    </div>
+
+    <div class="fvc-fbar-group">
+      <span class="fvc-fbar-label">Insurance &amp; billing</span>
+      <label class="fvc-fbar-check"><input type="checkbox" name="icbc" value="1"<?php echo $ck('icbc'); ?>> <span>ICBC approved</span></label>
+      <label class="fvc-fbar-check"><input type="checkbox" name="worksafe" value="1"<?php echo $ck('worksafe'); ?>> <span>WorkSafeBC</span></label>
+      <label class="fvc-fbar-check"><input type="checkbox" name="billing" value="1"<?php echo $ck('billing'); ?>> <span>Direct billing</span></label>
+      <label class="fvc-fbar-check"><input type="checkbox" name="booking" value="1"<?php echo $ck('booking'); ?>> <span>Online booking</span></label>
+    </div>
+
+    <div class="fvc-fbar-group">
+      <span class="fvc-fbar-label">Sort by</span>
+      <select class="fvc-fbar-select" name="sort">
+        <option value=""<?php selected($sortSel, ''); ?>>Best match</option>
+        <option value="rating"<?php selected($sortSel, 'rating'); ?>>Highest rated</option>
+        <option value="reviews"<?php selected($sortSel, 'reviews'); ?>>Most reviewed</option>
+        <option value="name"<?php selected($sortSel, 'name'); ?>>Name (A–Z)</option>
+      </select>
+    </div>
+
+    <button type="submit" class="fvc-fbar-apply">Show clinics</button>
+  </form>
+</div>
+<style>
+.fvc-fbar{font-family:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;}
+.fvc-fbar *{box-sizing:border-box;}
+.fvc-fbar-trigger{display:none;align-items:center;gap:8px;width:100%;justify-content:center;padding:13px;border:1px solid rgba(9,9,11,.15);border-radius:10px;background:#fff;color:#09090B;font-size:15px;font-weight:600;cursor:pointer;position:relative;}
+.fvc-fbar-dot{width:8px;height:8px;border-radius:50%;background:#09BDB8;display:inline-block;}
+.fvc-fbar-panel{background:#fff;border:1px solid rgba(9,9,11,.1);border-radius:14px;padding:20px;display:flex;flex-direction:column;gap:20px;box-shadow:0 1px 2px rgba(0,0,0,.04);}
+.fvc-fbar-head{display:flex;align-items:center;gap:10px;}
+.fvc-fbar-title{font-size:17px;font-weight:600;color:#09090B;}
+.fvc-fbar-clear{margin-left:auto;font-size:13px;font-weight:600;color:#09BDB8;text-decoration:none;}
+.fvc-fbar-clear:hover{text-decoration:underline;}
+.fvc-fbar-close{display:none;background:none;border:0;font-size:26px;line-height:1;color:#6e6e73;cursor:pointer;padding:0 4px;}
+.fvc-fbar-group{display:flex;flex-direction:column;gap:9px;}
+.fvc-fbar-label{font-size:11px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:#8a8a8f;}
+.fvc-fbar-cats{display:flex;flex-wrap:wrap;gap:7px;}
+.fvc-fbar-cat{display:inline-block;padding:7px 12px;border:1px solid rgba(9,9,11,.14);border-radius:999px;font-size:13px;font-weight:500;color:#33333a;text-decoration:none;transition:all .14s;}
+.fvc-fbar-cat:hover{border-color:#09BDB8;color:#0a8078;}
+.fvc-fbar-cat.is-on{background:#09BDB8;border-color:#09BDB8;color:#fff;}
+.fvc-fbar-select{width:100%;padding:11px 12px;border:1px solid rgba(9,9,11,.16);border-radius:8px;font-size:14px;color:#09090B;background:#fff;-webkit-appearance:none;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236e6e73' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;}
+.fvc-fbar-check{display:flex;align-items:center;gap:10px;font-size:14px;color:#33333a;cursor:pointer;padding:3px 0;}
+.fvc-fbar-check input{width:18px;height:18px;accent-color:#09BDB8;cursor:pointer;flex:none;}
+.fvc-fbar-apply{padding:13px;border:0;border-radius:8px;background:linear-gradient(135deg,#12c7c1,#0a9b96);color:#fff;font-size:15px;font-weight:600;cursor:pointer;box-shadow:0 6px 18px rgba(9,189,184,.28);}
+.fvc-fbar-apply:hover{transform:translateY(-1px);}
+@media(max-width:1024px){
+  .fvc-fbar-trigger{display:flex;}
+  .fvc-fbar-panel{display:none;position:fixed;left:0;right:0;bottom:0;top:auto;max-height:88vh;overflow-y:auto;z-index:100001;border-radius:16px 16px 0 0;box-shadow:0 -18px 50px rgba(0,0,0,.3);}
+  .fvc-fbar.is-open .fvc-fbar-panel{display:flex;}
+  .fvc-fbar.is-open::before{content:"";position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:100000;}
+  .fvc-fbar-close{display:block;margin-left:auto;}
+  .fvc-fbar-head .fvc-fbar-clear{margin-left:0;}
+}
+</style>
+<script>(function(){
+  var bar=document.getElementById('fvcFilter'); if(!bar) return;
+  var trig=bar.querySelector('.fvc-fbar-trigger'), close=bar.querySelector('.fvc-fbar-close');
+  function open(){bar.classList.add('is-open');if(trig)trig.setAttribute('aria-expanded','true');document.body.style.overflow='hidden';}
+  function shut(){bar.classList.remove('is-open');if(trig)trig.setAttribute('aria-expanded','false');document.body.style.overflow='';}
+  if(trig)trig.addEventListener('click',open);
+  if(close)close.addEventListener('click',shut);
+  bar.addEventListener('click',function(e){if(e.target===bar)shut();});
+})();</script>
+<?php
+    return ob_get_clean();
+}
+
 // Category-specific archive hero. The GeoDirectory archive template (Elementor 431) renders ONE
 // generic hero ("Find a Health Clinic in Vancouver", 5 specialities, 5 category pills, "All Services"
 // breadcrumb) for every category. This makes it reflect the actual category + real category count.
