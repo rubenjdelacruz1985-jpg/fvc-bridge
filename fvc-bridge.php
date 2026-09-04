@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.109
+ * Version: 1.16.110
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.109');
+define('FVC_BRIDGE_VERSION',    '1.16.110');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1431,6 +1431,8 @@ body:has(#fvcMobileMenu.open) #fvc-sb-wrap{display:none!important;}
 body .fvc-hero-breadcrumb,body .fvc-hero-breadcrumb *{color:rgba(255,255,255,.68)!important;}
 body .fvc-hero-sub{color:rgba(255,255,255,.66)!important;}
 body .fvc-trust-text{color:rgba(255,255,255,.62)!important;}
+/* Trust strip removed (Ruben) — let the body follow the search/hero directly. */
+body .fvc-trust-strip{display:none!important;}
 body .fvc-cats-sub,body .fvc-hood-sub{color:rgba(9,9,11,.66)!important;}
 .fvc-card-meta,.fvc-card-meta-item,.fvc-card-row,.fvc-card-service-tag{color:#4f4f57!important;}
 .fvc-card-rating-count{color:rgba(0,0,0,.6)!important;}
