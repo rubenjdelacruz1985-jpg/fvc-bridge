@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.128
+ * Version: 1.16.129
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.128');
+define('FVC_BRIDGE_VERSION',    '1.16.129');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -531,7 +531,8 @@ function fvc_bridge_rest_social_config($req) {
         return new WP_REST_Response(array(
             'ok' => true,
             'fbConfigured' => (bool) ( get_option('fvc_meta_page_id') && $tok ),
-            'igConfigured' => (bool) ( get_option('fvc_meta_ig_id') && $tok ),
+            'igConfigured' => (bool) ( get_option('fvc_meta_ig_id') && ( get_option('fvc_meta_ig_token') || $tok ) ),
+            'igDirect'     => (bool) get_option('fvc_meta_ig_token'),
             'auto'         => (bool) get_option('fvc_social_auto'),
             'redirect'     => admin_url('admin.php'),
         ), 200);
@@ -540,13 +541,14 @@ function fvc_bridge_rest_social_config($req) {
     if ( isset($p['fb_page_id']) )      update_option('fvc_meta_page_id', sanitize_text_field($p['fb_page_id']));
     if ( ! empty($p['fb_page_token']) ) update_option('fvc_meta_page_token', sanitize_text_field($p['fb_page_token']));
     if ( isset($p['ig_user_id']) )      update_option('fvc_meta_ig_id', sanitize_text_field($p['ig_user_id']));
+    if ( ! empty($p['ig_token']) )      update_option('fvc_meta_ig_token', sanitize_text_field($p['ig_token'])); // Instagram-login token (no FB Page)
     if ( isset($p['auto']) )            update_option('fvc_social_auto', ! empty($p['auto']) ? 1 : 0);
     return new WP_REST_Response(array('ok' => true, 'saved' => true), 200);
 }
 
 // Post to the FB Page feed + Instagram (IG requires a public image_url). Returns per-network results.
 function fvc_bridge_social_post($message, $link = '', $image_url = '') {
-    $pageId = get_option('fvc_meta_page_id'); $token = get_option('fvc_meta_page_token'); $igId = get_option('fvc_meta_ig_id');
+    $pageId = get_option('fvc_meta_page_id'); $token = get_option('fvc_meta_page_token'); $igId = get_option('fvc_meta_ig_id'); $igToken = get_option('fvc_meta_ig_token');
     $out = array('fb' => null, 'ig' => null);
     if ( $pageId && $token ) {
         $body = array('message' => $message, 'access_token' => $token);
@@ -554,11 +556,14 @@ function fvc_bridge_social_post($message, $link = '', $image_url = '') {
         $r = wp_remote_post(FVC_GRAPH . $pageId . '/feed', array('timeout' => 20, 'body' => $body));
         $out['fb'] = is_wp_error($r) ? array('error' => $r->get_error_message()) : json_decode(wp_remote_retrieve_body($r), true);
     }
-    if ( $igId && $token && $image_url ) {
-        $c = wp_remote_post(FVC_GRAPH . $igId . '/media', array('timeout' => 25, 'body' => array('image_url' => $image_url, 'caption' => $message . ($link ? "\n\n" . $link : ''), 'access_token' => $token)));
+    if ( $igId && $image_url && ( $igToken || $token ) ) {
+        // Prefer the Instagram-login token (graph.instagram.com — no Facebook Page needed); else the Page-token route.
+        $ig_api = $igToken ? 'https://graph.instagram.com/v21.0/' : FVC_GRAPH;
+        $ig_tok = $igToken ? $igToken : $token;
+        $c = wp_remote_post($ig_api . $igId . '/media', array('timeout' => 25, 'body' => array('image_url' => $image_url, 'caption' => $message . ($link ? "\n\n" . $link : ''), 'access_token' => $ig_tok)));
         $cj = is_wp_error($c) ? null : json_decode(wp_remote_retrieve_body($c), true);
         if ( ! empty($cj['id']) ) {
-            $pub = wp_remote_post(FVC_GRAPH . $igId . '/media_publish', array('timeout' => 25, 'body' => array('creation_id' => $cj['id'], 'access_token' => $token)));
+            $pub = wp_remote_post($ig_api . $igId . '/media_publish', array('timeout' => 25, 'body' => array('creation_id' => $cj['id'], 'access_token' => $ig_tok)));
             $out['ig'] = is_wp_error($pub) ? array('error' => $pub->get_error_message()) : json_decode(wp_remote_retrieve_body($pub), true);
         } else {
             $out['ig'] = is_wp_error($c) ? array('error' => $c->get_error_message()) : $cj;
@@ -572,7 +577,7 @@ function fvc_bridge_rest_social_post($req) {
     $p = $req->get_json_params(); if ( ! is_array($p) ) $p = $req->get_params();
     $msg = sanitize_textarea_field($p['message'] ?? '');
     if ( ! $msg ) return new WP_REST_Response(array('ok' => false, 'error' => 'message required'), 400);
-    if ( ! get_option('fvc_meta_page_token') ) return new WP_REST_Response(array('ok' => false, 'error' => 'not_configured', 'message' => 'Set the Meta Page token via /social-config first.'), 200);
+    if ( ! get_option('fvc_meta_page_token') && ! get_option('fvc_meta_ig_token') ) return new WP_REST_Response(array('ok' => false, 'error' => 'not_configured', 'message' => 'Set an Instagram token (or Page token) via /social-config first.'), 200);
     $res = fvc_bridge_social_post($msg, esc_url_raw($p['link'] ?? ''), esc_url_raw($p['image_url'] ?? ''));
     return new WP_REST_Response(array('ok' => true, 'result' => $res), 200);
 }
@@ -583,7 +588,7 @@ add_action('transition_post_status', 'fvc_bridge_social_autopost', 10, 3);
 function fvc_bridge_social_autopost($new, $old, $post) {
     if ( $new !== 'publish' || $old === 'publish' ) return;      // first publish only
     if ( ! isset($post->post_type) || $post->post_type !== 'post' ) return;
-    if ( ! get_option('fvc_social_auto') || ! get_option('fvc_meta_page_token') ) return;
+    if ( ! get_option('fvc_social_auto') || ( ! get_option('fvc_meta_page_token') && ! get_option('fvc_meta_ig_token') ) ) return;
     if ( get_post_meta($post->ID, '_fvc_social_done', true) ) return;
     wp_schedule_single_event(time() + 30, 'fvc_social_post_event', array($post->ID));
 }
