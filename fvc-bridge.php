@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.117
+ * Version: 1.16.119
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.117');
+define('FVC_BRIDGE_VERSION',    '1.16.119');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1330,6 +1330,38 @@ body.post-type-archive-gd_place .fvc-card-service-tag ~ .fvc-card-service-tag ~ 
   body .fvc-cat-stats{margin-top:12px !important;}
   body .fvc-hero-guide{margin-top:10px !important;}
 }
+</style>
+HTML;
+}
+
+// Clinic profile (single listing) — dark hero, light body (was fully dark). Keeps the photo hero dark.
+add_action('wp_head', 'fvc_bridge_profile_css', 34);
+function fvc_bridge_profile_css() {
+    if ( ! ( function_exists('is_singular') && is_singular('gd_place') ) ) return;
+    echo <<<'HTML'
+<style id="fvc-profile-light">
+/* page ground -> cream; the hero keeps its own dark .fvc-sl-hero-bg so it stays dark */
+body .fvc-sl-wrap{background:#f4f2ed !important;}
+/* body text -> dark */
+body .fvc-sl-body{color:#33333a !important;}
+body .fvc-sl-desc{color:#4f4f57 !important;}
+body .fvc-sl-body h1,body .fvc-sl-body h2,body .fvc-sl-body h3,body .fvc-sl-body h4,body .fvc-sl-card-title,body .fvc-sl-h{color:#1d1d1f !important;}
+/* sidebar + any body cards -> white */
+body .fvc-sl-card{background:#fff !important;border:1px solid rgba(9,9,11,.1) !important;box-shadow:0 2px 14px rgba(0,0,0,.06) !important;}
+/* info / hours -> dark; the pink info items become neutral */
+body .fvc-sl-info,body .fvc-sl-info *,body .fvc-sl-hours,body .fvc-sl-hours *,body .fvc-sl-info-item{color:#33333a !important;}
+body .fvc-sl-hours-row{border-bottom-color:rgba(9,9,11,.1) !important;}
+body .fvc-sl-meta-label,body .fvc-sl-hours-label,body .fvc-sl-info-label,body .fvc-sl-label{color:#8a8a8f !important;}
+/* contact links -> brand teal (were pink/white) */
+body .fvc-sl-card a:not(.fvc-sl-btn),body .fvc-sl-info a,body .fvc-sl-link{color:#0a8078 !important;}
+body .fvc-sl-card a:not(.fvc-sl-btn):hover,body .fvc-sl-info a:hover{color:#12c7c1 !important;}
+/* secondary "Call" button was translucent-white (for dark) -> light outline */
+body .fvc-sl-btn--secondary{background:#fff !important;border:1px solid rgba(9,9,11,.18) !important;color:#1d1d1f !important;}
+/* map frame border */
+body .fvc-sl-map,body .fvc-sl-map iframe{border-color:rgba(9,9,11,.1) !important;}
+/* "Claim this listing" link was faint white -> visible on the light body */
+body .fvc-sl-claim{color:#6e6e73 !important;}
+body .fvc-sl-claim a{color:#0a8078 !important;}
 </style>
 HTML;
 }
