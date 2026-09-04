@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.107
+ * Version: 1.16.108
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.107');
+define('FVC_BRIDGE_VERSION',    '1.16.108');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1229,11 +1229,26 @@ function fvc_bridge_archive_hero() {
             if ( isset($gmap[$term->slug]) ) $guide = array('url' => home_url('/' . $gmap[$term->slug][0] . '/'), 'label' => $gmap[$term->slug][1]);
         }
     }
+    // Category-specific hero stats (uniform across every category hero; the built-in one was
+    // site-wide + only present on some categories). Clinic count from the term; hoods + avg rating queried.
+    $stats = null;
+    if ( $isCat && isset($term) && $term && ! is_wp_error($term) ) {
+        global $wpdb;
+        $dt = $wpdb->prefix . 'geodir_gd_place_detail';
+        $row = $wpdb->get_row($wpdb->prepare(
+            "SELECT COUNT(DISTINCT NULLIF(d.neighbourhood,'')) hoods, AVG(NULLIF(d.google_rating,0)) avgr
+             FROM {$dt} d INNER JOIN {$wpdb->term_relationships} tr ON tr.object_id = d.post_id
+             WHERE tr.term_taxonomy_id = %d", (int) $term->term_taxonomy_id));
+        $stats = array('count' => (int) $term->count, 'hoods' => $row ? (int) $row->hoods : 0, 'avg' => ($row && $row->avgr) ? round((float) $row->avgr, 1) : 0);
+    }
     $cats = fvc_bridge_nav_categories();
-    $data = array('isCat' => $isCat, 'h1' => $h1, 'desc' => $desc, 'catName' => $catName, 'guide' => $guide, 'cats' => $cats, 'count' => count($cats));
+    $data = array('isCat' => $isCat, 'h1' => $h1, 'desc' => $desc, 'catName' => $catName, 'guide' => $guide, 'stats' => $stats, 'cats' => $cats, 'count' => count($cats));
     echo '<script>window.FVC_ARCHIVE=' . wp_json_encode($data) . ';</script>' . "\n";
     echo <<<'HTML'
 <style>
+body .fvc-cat-stats{display:flex!important;flex-wrap:wrap!important;gap:14px 26px!important;margin-top:20px!important;}
+body .fvc-cat-stats span{font-size:13.5px!important;color:rgba(255,255,255,.72)!important;}
+body .fvc-cat-stats b{display:inline-block!important;color:#2fd4cf!important;font-weight:700!important;font-size:19px!important;margin-right:5px!important;}
 body .fvc-hero-guide{display:inline-flex!important;align-items:center!important;gap:6px!important;margin-top:16px!important;color:#2fd4cf!important;font-weight:600!important;font-size:14.5px!important;text-decoration:none!important;transition:gap .14s,color .14s!important;}
 body .fvc-hero-guide:hover{color:#4fe8e3!important;gap:10px!important;}
 </style>
@@ -1254,11 +1269,24 @@ body .fvc-hero-guide:hover{color:#4fe8e3!important;gap:10px!important;}
       var h1=document.querySelector('.fvc-hero-h1');
       if(h1&&A.h1) h1.innerHTML=esc(A.h1)+'<br class="fvc-hero-br"> <span class="fvc-hero-h1-accent">in Vancouver</span>';
       var bc=document.querySelector('.fvc-hero-breadcrumb-current'); if(bc&&A.catName) bc.textContent=A.catName;
-      // topic-cluster link: archive -> its guide (once)
+      // uniform category stats bar (hide the built-in site-wide one, which only some categories had)
+      if(A.stats&&d){
+        document.querySelectorAll('.fvc-hero-stats').forEach(function(e){e.style.setProperty('display','none','important');});
+        if(!document.querySelector('.fvc-cat-stats')){
+          var sb=document.createElement('div'); sb.className='fvc-cat-stats';
+          var p=['<span><b>'+A.stats.count+'</b> clinics</span>'];
+          if(A.stats.hoods) p.push('<span><b>'+A.stats.hoods+'</b> neighbourhoods</span>');
+          if(A.stats.avg) p.push('<span><b>'+A.stats.avg+'★</b> avg rating</span>');
+          sb.innerHTML=p.join('');
+          d.parentNode.insertBefore(sb, d.nextSibling);
+        }
+      }
+      // topic-cluster link: archive -> its guide (once), after the stats
       if(A.guide&&d&&!document.querySelector('.fvc-hero-guide')){
         var g=document.createElement('a'); g.className='fvc-hero-guide'; g.href=A.guide.url;
         g.innerHTML='New here? '+esc(A.guide.label)+' <span aria-hidden="true">&rarr;</span>';
-        if(d.parentNode) d.parentNode.insertBefore(g, d.nextSibling);
+        var afterEl=document.querySelector('.fvc-cat-stats')||d;
+        afterEl.parentNode.insertBefore(g, afterEl.nextSibling);
       }
     }
   }
