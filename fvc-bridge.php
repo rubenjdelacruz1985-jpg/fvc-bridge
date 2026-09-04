@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.123
+ * Version: 1.16.124
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.123');
+define('FVC_BRIDGE_VERSION',    '1.16.124');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -212,6 +212,12 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => function () { return is_user_logged_in() || fvc_bridge_has_valid_token(); },
         'callback'            => 'fvc_bridge_rest_seo_scan',
+    ));
+    // Token-gated: move a clinic listing to Trash (REVERSIBLE — never a permanent delete).
+    register_rest_route('fvc-bridge/v1', '/trash-listing', array(
+        'methods'             => 'POST',
+        'permission_callback' => 'fvc_bridge_has_valid_token',
+        'callback'            => 'fvc_bridge_rest_trash_listing',
     ));
     // ---- Booking v1 (native) ----
     register_rest_route('fvc-bridge/v1', '/booking-config', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_booking_config'));
@@ -491,6 +497,23 @@ function fvc_bridge_rest_seo_scan($req) {
     );
     update_post_meta($id, $meta_key, $report);
     return new WP_REST_Response($report, 200);
+}
+
+// REST: move a gd_place listing to Trash (REVERSIBLE — lands in Trash, never hard-deleted).
+// Token-gated. {id} trashes; {id, restore:true} restores from Trash.
+function fvc_bridge_rest_trash_listing($req) {
+    $p = $req->get_json_params(); if ( ! is_array($p) ) $p = $req->get_params();
+    $id = (int) ($p['id'] ?? $p['listing'] ?? $p['listingId'] ?? 0);
+    if ( ! $id ) return new WP_REST_Response(array('ok' => false, 'error' => 'id required'), 400);
+    $post = get_post($id);
+    if ( ! $post || $post->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'not a clinic listing'), 404);
+    $name = html_entity_decode($post->post_title, ENT_QUOTES);
+    if ( ! empty($p['restore']) ) {
+        $r = wp_untrash_post($id);
+        return new WP_REST_Response(array('ok' => (bool) $r, 'id' => $id, 'name' => $name, 'action' => 'restored', 'status' => get_post_status($id)), 200);
+    }
+    $r = wp_trash_post($id); // reversible
+    return new WP_REST_Response(array('ok' => (bool) $r, 'id' => $id, 'name' => $name, 'action' => 'trashed', 'status' => get_post_status($id)), 200);
 }
 
 // Take a clinic's site offline (draft) — same ownership rules as clinic-publish.
@@ -1498,13 +1521,13 @@ body.post-type-archive-gd_place .fvc-card-service-tag ~ .fvc-card-service-tag ~ 
 HTML;
 }
 
-// Sign-up form pages: hide the global fixed "Search clinics" bar. It's a patient-facing
-// search that has no place on a clinic owner's sign-up form and, on mobile, covers the
-// fields and the submit button as they scroll.
-add_action('wp_head', 'fvc_bridge_signup_hide_searchbar', 34);
-function fvc_bridge_signup_hide_searchbar() {
-    if ( ! ( function_exists('is_page') && is_page(array('claim-listing', 'list-your-clinic')) ) ) return;
-    echo '<style id="fvc-signup-nosearch">body #fvc-sb-wrap{display:none !important;}</style>' . "\n";
+// The fixed bottom "Search clinics" bar is an entry-point control — keep it on the homepage
+// only. Hide it on every inside page (clinic profiles, tools, hubs, blog, sign-up forms) and
+// on search/archive results, where it just covers content.
+add_action('wp_head', 'fvc_bridge_hide_searchbar', 34);
+function fvc_bridge_hide_searchbar() {
+    if ( function_exists('is_front_page') && is_front_page() ) return;
+    echo '<style id="fvc-hide-searchbar">body #fvc-sb-wrap{display:none !important;}</style>' . "\n";
 }
 
 // Clinic profile (single listing) — dark hero, light body (was fully dark). Keeps the photo hero dark.
