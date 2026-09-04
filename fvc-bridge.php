@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.114
+ * Version: 1.16.117
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.114');
+define('FVC_BRIDGE_VERSION',    '1.16.117');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1305,6 +1305,31 @@ body .fvc-cta-btn:hover{filter:brightness(1.05)!important;}
 /* off-brand pink (#CC3366) neighbourhood items -> neutral with teal hover */
 body .fvc-hood-item{border-color:rgba(9,9,11,.16)!important;color:#1d1d1f!important;}
 body .fvc-hood-item:hover{border-color:#09BDB8!important;color:#0a8078!important;}
+</style>
+HTML;
+}
+
+// Archive/search UX cleanup — declutter result cards + keep the filter reachable on mobile.
+add_action('wp_head', 'fvc_bridge_archive_ux_css', 34);
+function fvc_bridge_archive_ux_css() {
+    if ( fvc_bridge_is_standalone() ) return;
+    echo <<<'HTML'
+<style id="fvc-archive-ux">
+/* Result cards were bloated with up to 6 category "service tags". On a category page they're
+   redundant (you're already in that category) — hide them; keep the useful billing/insurance badges. */
+body.tax-gd_placecategory .fvc-card-service-tag{display:none !important;}
+/* On the all-clinics archive keep at most two for context. */
+body.post-type-archive-gd_place .fvc-card-service-tag ~ .fvc-card-service-tag ~ .fvc-card-service-tag{display:none !important;}
+/* Mobile: the "Filter clinics" trigger becomes a floating teal pill (bottom-left, opposite the
+   scroll-top button) so it's always reachable while scrolling — and the results start right after the hero. */
+@media (max-width:768px){
+  body.geodir-archive .fvc-fbar-trigger{position:fixed !important;left:16px !important;bottom:18px !important;top:auto !important;right:auto !important;width:auto !important;z-index:90 !important;padding:13px 20px !important;border-radius:999px !important;background:#09BDB8 !important;color:#fff !important;border:0 !important;box-shadow:0 8px 24px rgba(9,189,184,.45) !important;}
+  body.geodir-archive .fvc-fbar-trigger svg{stroke:#fff !important;}
+  /* tighten the category hero on mobile so results come up sooner (keeps all the info) */
+  body.geodir-archive .fvc-hero{padding-top:74px !important;padding-bottom:20px !important;}
+  body .fvc-cat-stats{margin-top:12px !important;}
+  body .fvc-hero-guide{margin-top:10px !important;}
+}
 </style>
 HTML;
 }
