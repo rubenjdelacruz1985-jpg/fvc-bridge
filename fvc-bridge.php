@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.87
+ * Version: 1.16.88
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.87');
+define('FVC_BRIDGE_VERSION',    '1.16.88');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -236,6 +236,10 @@ add_action('rest_api_init', function () {
     register_rest_route('fvc-bridge/v1', '/sms-balance', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_sms_balance'));
     register_rest_route('fvc-bridge/v1', '/sms-load', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_sms_load'));
     register_rest_route('fvc-bridge/v1', '/sms-verify', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_sms_verify'));
+    register_rest_route('fvc-bridge/v1', '/gcal-start', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_gcal_start'));
+    register_rest_route('fvc-bridge/v1', '/gcal-callback', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_gcal_callback'));
+    register_rest_route('fvc-bridge/v1', '/gcal-status', array('methods'=>'GET','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_gcal_status'));
+    register_rest_route('fvc-bridge/v1', '/gcal-disconnect', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_gcal_disconnect'));
     register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
     // Public read: a clinic's listing data, formatted to seed the site builder.
     register_rest_route('fvc-bridge/v1', '/clinic-data', array(
@@ -2009,7 +2013,7 @@ function fvc_bridge_booking_table() { global $wpdb; return $wpdb->prefix . 'fvc_
 function fvc_bridge_booking_ensure_table() {
     global $wpdb;
     $t = fvc_bridge_booking_table();
-    if ( get_option('fvc_bridge_booking_db') === '6' ) return;
+    if ( get_option('fvc_bridge_booking_db') === '7' ) return;
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     $charset = $wpdb->get_charset_collate();
     dbDelta("CREATE TABLE $t (
@@ -2035,12 +2039,13 @@ function fvc_bridge_booking_ensure_table() {
         stripe_acct VARCHAR(40) DEFAULT '',
         credit_code VARCHAR(40) DEFAULT '',
         credit_applied_cents INT DEFAULT 0,
+        gcal_event VARCHAR(80) DEFAULT '',
         created_at DATETIME NOT NULL,
         PRIMARY KEY (id),
         KEY listing_id (listing_id),
         KEY start_local (start_local)
     ) $charset;");
-    update_option('fvc_bridge_booking_db', '6');
+    update_option('fvc_bridge_booking_db', '7');
 }
 
 function fvc_bridge_booking_defaults($listing_id) {
@@ -2112,13 +2117,16 @@ function fvc_bridge_rest_booking_config_admin($req) {
     $cfg['ok'] = true; $cfg['listingId'] = $id; $cfg['hasSecret'] = fvc_bridge_booking_secret($id) !== '';
     $cfg['connect'] = array('platformOn' => fvc_bridge_stripe_platform_sk() !== '', 'acct' => fvc_bridge_stripe_connect_acct($id), 'feePct' => fvc_bridge_stripe_platform_fee_pct());
     $cfg['sms'] = array('balanceCents' => fvc_bridge_sms_balance($id), 'costCents' => fvc_bridge_sms_cost_cents(), 'on' => (bool) ( get_option('fvc_twilio_sid') && get_option('fvc_twilio_from') ));
+    list($gcid) = fvc_bridge_gcal_client();
+    $cfg['gcal'] = array('available' => $gcid !== '', 'connected' => fvc_bridge_gcal_connected($id));
     return new WP_REST_Response($cfg, 200);
 }
 
 // ---- Stripe Connect onboarding (Express accounts + Account Links) ----
 function fvc_bridge_rest_stripe_platform_config($req) {
     $out = function () { return array('ok' => true, 'configured' => fvc_bridge_stripe_platform_sk() !== '', 'feePct' => fvc_bridge_stripe_platform_fee_pct(),
-        'twilioOn' => (bool) ( get_option('fvc_twilio_sid') && get_option('fvc_twilio_from') ), 'smsCostCents' => fvc_bridge_sms_cost_cents(), 'twilioFrom' => get_option('fvc_twilio_from', '')); };
+        'twilioOn' => (bool) ( get_option('fvc_twilio_sid') && get_option('fvc_twilio_from') ), 'smsCostCents' => fvc_bridge_sms_cost_cents(), 'twilioFrom' => get_option('fvc_twilio_from', ''),
+        'googleOn' => get_option('fvc_google_client_id', '') !== '', 'googleRedirect' => rest_url('fvc-bridge/v1/gcal-callback')); };
     if ( $req->get_method() === 'GET' ) return new WP_REST_Response($out(), 200);
     $b = $req->get_json_params();
     if ( isset($b['sk']) ) { $sk = trim((string) $b['sk']); if ( $sk === '__clear__' ) delete_option('fvc_stripe_platform_sk'); elseif ( $sk !== '' && strpos($sk, '••') === false ) update_option('fvc_stripe_platform_sk', $sk); }
@@ -2128,6 +2136,9 @@ function fvc_bridge_rest_stripe_platform_config($req) {
     if ( isset($b['twilio_token']) ) { $tk = trim((string) $b['twilio_token']); if ( $tk === '__clear__' ) delete_option('fvc_twilio_token'); elseif ( $tk !== '' && strpos($tk, '••') === false ) update_option('fvc_twilio_token', $tk); }
     if ( isset($b['twilio_from']) ) update_option('fvc_twilio_from', sanitize_text_field($b['twilio_from']));
     if ( isset($b['sms_cost']) ) update_option('fvc_sms_cost_cents', max(0, (int) $b['sms_cost']));
+    // Google Calendar OAuth app (platform-wide)
+    if ( isset($b['google_client_id']) ) update_option('fvc_google_client_id', sanitize_text_field($b['google_client_id']));
+    if ( isset($b['google_client_secret']) ) { $gs = trim((string) $b['google_client_secret']); if ( $gs === '__clear__' ) delete_option('fvc_google_client_secret'); elseif ( $gs !== '' && strpos($gs, '••') === false ) update_option('fvc_google_client_secret', $gs); }
     return new WP_REST_Response($out(), 200);
 }
 function fvc_bridge_rest_booking_connect_start($req) {
@@ -2233,6 +2244,7 @@ function fvc_bridge_rest_booking_slots($req) {
     $minTime = new DateTime('now', $tz); if ( $minNotice > 0 ) $minTime->modify('+' . $minNotice . ' hours');
     $limit = new DateTime('now', $tz); $limit->setTime(23, 59, 59); $limit->modify('+' . $maxAdv . ' days');
     if ( $day > $limit ) return new WP_REST_Response(array('ok' => true, 'date' => $date, 'slots' => array()), 200);
+    $gbusy = fvc_bridge_gcal_busy($id, $date, $cfg['timezone']); // 2-way: block times the clinic is busy in Google Calendar
     $slots = array(); $guard = 0;
     while ( $guard++ < 200 ) {
         $slotEnd = clone $cur; $slotEnd->modify('+' . $svcMin . ' minutes');
@@ -2253,6 +2265,7 @@ function fvc_bridge_rest_booking_slots($req) {
                     $bS = $bkS->getTimestamp() - $buffer * 60; $bE = $bkE->getTimestamp() + $buffer * 60;
                     if ( $sT < $bE && $eT > $bS ) { $clash = true; break; }
                 }
+                if ( ! $clash ) foreach ( $gbusy as $gb ) { if ( $sT < $gb[1] && $eT > $gb[0] ) { $clash = true; break; } }
                 if ( ! $clash ) $slots[] = $cur->format('H:i');
             }
         }
@@ -2490,6 +2503,7 @@ function fvc_bridge_rest_booking_create($req) {
     }
 
     fvc_bridge_booking_emails_new($appt, $cfg, $manageUrl);
+    fvc_bridge_gcal_push($appt, 'create');
     return new WP_REST_Response(array('ok' => true, 'id' => $aid, 'when' => $when, 'manageUrl' => $manageUrl, 'icsUrl' => $icsUrl), 200);
 }
 
@@ -2520,6 +2534,7 @@ function fvc_bridge_rest_booking_verify_payment($req) {
     }
     $appt = $row; $appt['status'] = 'pending';
     fvc_bridge_booking_emails_new($appt, $cfg, $manageUrl);
+    fvc_bridge_gcal_push($appt, 'create');
     return new WP_REST_Response(array('ok' => true, 'paid' => true, 'when' => $when, 'manageUrl' => $manageUrl, 'icsUrl' => $icsUrl), 200);
 }
 
@@ -2600,7 +2615,7 @@ function fvc_bridge_rest_booking_status($req) {
         }
     }
     if ( $status === 'confirmed' || $status === 'cancelled' ) fvc_bridge_booking_notify_patient($row, $cfg, $status);
-    if ( $status === 'cancelled' ) fvc_bridge_waitlist_notify((int) $row['listing_id'], substr($row['start_local'], 0, 10));
+    if ( $status === 'cancelled' ) { fvc_bridge_waitlist_notify((int) $row['listing_id'], substr($row['start_local'], 0, 10)); fvc_bridge_gcal_push($row, 'delete'); }
     return new WP_REST_Response(array('ok' => true, 'status' => $status, 'refunded' => $refunded), 200);
 }
 
@@ -2667,6 +2682,7 @@ function fvc_bridge_rest_booking_reschedule($req) {
     $wpdb->update($t, array('start_local' => $s, 'end_local' => $e, 'reminded' => 0), array('id' => $aid));
     $row['start_local'] = $s; $row['end_local'] = $e;
     fvc_bridge_booking_notify_patient($row, $cfg, 'rescheduled');
+    fvc_bridge_gcal_push($row, 'create');
     $when = $start->format('l, F j') . ' at ' . $start->format('g:i a');
     if ( function_exists('fvc_bridge_email_shell') ) {
         $owner = get_userdata((int) get_post_field('post_author', (int) $row['listing_id']));
@@ -3041,6 +3057,99 @@ function fvc_bridge_rest_sms_verify($req) {
     update_post_meta($lid, '_fvc_sms_balance_cents', fvc_bridge_sms_balance($lid) + $amt);
     set_transient($flag, 1, 30 * DAY_IN_SECONDS);
     return new WP_REST_Response(array('ok' => true, 'balanceCents' => fvc_bridge_sms_balance($lid), 'added' => $amt), 200);
+}
+
+// ============================================================
+//  Google Calendar 2-way sync — platform OAuth app (client id/secret in options),
+//  per-clinic tokens in meta. Pushes bookings to the clinic's Google Calendar and
+//  blocks their Google-busy times from the booking slots.
+// ============================================================
+function fvc_bridge_gcal_client() { return array(get_option('fvc_google_client_id', ''), get_option('fvc_google_client_secret', '')); }
+function fvc_bridge_gcal_redirect() { return rest_url('fvc-bridge/v1/gcal-callback'); }
+function fvc_bridge_gcal_connected($listing_id) { $t = get_post_meta($listing_id, '_fvc_gcal_tokens', true); return is_array($t) && ! empty($t['refresh_token']); }
+function fvc_bridge_gcal_token($listing_id) {
+    $t = get_post_meta($listing_id, '_fvc_gcal_tokens', true);
+    if ( ! is_array($t) || empty($t['refresh_token']) ) return '';
+    if ( ! empty($t['access_token']) && ! empty($t['expires']) && $t['expires'] > time() + 60 ) return $t['access_token'];
+    list($cid, $sec) = fvc_bridge_gcal_client(); if ( ! $cid || ! $sec ) return '';
+    $res = wp_remote_post('https://oauth2.googleapis.com/token', array('timeout' => 20, 'body' => array('client_id' => $cid, 'client_secret' => $sec, 'refresh_token' => $t['refresh_token'], 'grant_type' => 'refresh_token')));
+    if ( is_wp_error($res) ) return '';
+    $d = json_decode(wp_remote_retrieve_body($res), true);
+    if ( empty($d['access_token']) ) return '';
+    $t['access_token'] = $d['access_token']; $t['expires'] = time() + (int) ($d['expires_in'] ?? 3500);
+    update_post_meta($listing_id, '_fvc_gcal_tokens', $t);
+    return $t['access_token'];
+}
+function fvc_bridge_gcal_api($token, $method, $path, $body = null) {
+    $args = array('method' => $method, 'timeout' => 20, 'headers' => array('Authorization' => 'Bearer ' . $token, 'Content-Type' => 'application/json'));
+    if ( $body !== null ) $args['body'] = wp_json_encode($body);
+    $res = wp_remote_request('https://www.googleapis.com/calendar/v3/' . $path, $args);
+    if ( is_wp_error($res) ) return array('_status' => 0);
+    $d = json_decode(wp_remote_retrieve_body($res), true); if ( ! is_array($d) ) $d = array(); $d['_status'] = (int) wp_remote_retrieve_response_code($res); return $d;
+}
+function fvc_bridge_gcal_push($row, $action) {
+    $lid = (int) $row['listing_id']; if ( ! fvc_bridge_gcal_connected($lid) ) return;
+    $token = fvc_bridge_gcal_token($lid); if ( ! $token ) return;
+    $eid = $row['gcal_event'] ?? '';
+    if ( $action === 'delete' ) { if ( $eid ) fvc_bridge_gcal_api($token, 'DELETE', 'calendars/primary/events/' . rawurlencode($eid)); return; }
+    global $wpdb; $t = fvc_bridge_booking_table();
+    $tzName = fvc_bridge_booking_get_config($lid)['timezone'];
+    $iso = function ($local) use ($tzName) { $dt = DateTime::createFromFormat('Y-m-d H:i:s', $local, new DateTimeZone($tzName)); return $dt ? $dt->format('c') : null; };
+    $ev = array(
+        'summary' => ($row['service'] ?: 'Appointment') . ' — ' . $row['name'],
+        'description' => 'Booked via Find Vancouver Clinics' . ( ! empty($row['phone']) ? "\nPhone: " . $row['phone'] : '' ) . ( ! empty($row['email']) ? "\nEmail: " . $row['email'] : '' ),
+        'start' => array('dateTime' => $iso($row['start_local']), 'timeZone' => $tzName),
+        'end' => array('dateTime' => $iso($row['end_local']), 'timeZone' => $tzName),
+    );
+    if ( $eid ) fvc_bridge_gcal_api($token, 'PATCH', 'calendars/primary/events/' . rawurlencode($eid), $ev);
+    else { $r = fvc_bridge_gcal_api($token, 'POST', 'calendars/primary/events', $ev); if ( ! empty($r['id']) ) $wpdb->update($t, array('gcal_event' => $r['id']), array('id' => (int) $row['id'])); }
+}
+function fvc_bridge_gcal_busy($listing_id, $date, $tzName) {
+    if ( ! fvc_bridge_gcal_connected($listing_id) ) return array();
+    $ck = 'fvc_gcalb_' . $listing_id . '_' . $date; $c = get_transient($ck); if ( is_array($c) ) return $c;
+    $token = fvc_bridge_gcal_token($listing_id); if ( ! $token ) return array();
+    $tz = new DateTimeZone($tzName);
+    $min = DateTime::createFromFormat('Y-m-d H:i:s', $date . ' 00:00:00', $tz); $max = DateTime::createFromFormat('Y-m-d H:i:s', $date . ' 23:59:59', $tz);
+    if ( ! $min || ! $max ) return array();
+    $r = fvc_bridge_gcal_api($token, 'POST', 'freeBusy', array('timeMin' => $min->format('c'), 'timeMax' => $max->format('c'), 'timeZone' => $tzName, 'items' => array(array('id' => 'primary'))));
+    $busy = array();
+    if ( ! empty($r['calendars']['primary']['busy']) ) foreach ( $r['calendars']['primary']['busy'] as $b ) $busy[] = array(strtotime($b['start']), strtotime($b['end']));
+    set_transient($ck, $busy, 180);
+    return $busy;
+}
+function fvc_bridge_rest_gcal_start($req) {
+    $id = (int) $req->get_param('listing'); if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    list($cid, $sec) = fvc_bridge_gcal_client(); if ( ! $cid || ! $sec ) return new WP_REST_Response(array('ok' => false, 'error' => 'Google Calendar isn\'t set up yet.'), 400);
+    $nonce = wp_generate_password(24, false); set_transient('fvc_gcal_state_' . $nonce, $id, 3600);
+    $url = 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query(array(
+        'client_id' => $cid, 'redirect_uri' => fvc_bridge_gcal_redirect(), 'response_type' => 'code',
+        'scope' => 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly',
+        'access_type' => 'offline', 'prompt' => 'consent', 'state' => $nonce));
+    return new WP_REST_Response(array('ok' => true, 'url' => $url), 200);
+}
+function fvc_bridge_rest_gcal_callback($req) {
+    $code = $req->get_param('code'); $state = $req->get_param('state');
+    $lid = $state ? (int) get_transient('fvc_gcal_state_' . $state) : 0;
+    if ( ! $code || ! $lid ) { wp_redirect(home_url('/clinic-calendar/?gcal=error')); exit; }
+    delete_transient('fvc_gcal_state_' . $state);
+    list($cid, $sec) = fvc_bridge_gcal_client();
+    $res = wp_remote_post('https://oauth2.googleapis.com/token', array('timeout' => 20, 'body' => array('code' => $code, 'client_id' => $cid, 'client_secret' => $sec, 'redirect_uri' => fvc_bridge_gcal_redirect(), 'grant_type' => 'authorization_code')));
+    $d = is_wp_error($res) ? array() : json_decode(wp_remote_retrieve_body($res), true);
+    if ( empty($d['access_token']) ) { wp_redirect(home_url('/clinic-calendar/?gcal=error')); exit; }
+    $existing = get_post_meta($lid, '_fvc_gcal_tokens', true);
+    $refresh = $d['refresh_token'] ?? ( is_array($existing) ? ($existing['refresh_token'] ?? '') : '' );
+    update_post_meta($lid, '_fvc_gcal_tokens', array('refresh_token' => $refresh, 'access_token' => $d['access_token'] ?? '', 'expires' => time() + (int) ($d['expires_in'] ?? 3500)));
+    wp_redirect(home_url('/clinic-calendar/?gcal=done')); exit;
+}
+function fvc_bridge_rest_gcal_status($req) {
+    $id = (int) $req->get_param('listing'); if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    list($cid) = fvc_bridge_gcal_client();
+    return new WP_REST_Response(array('ok' => true, 'available' => $cid !== '', 'connected' => fvc_bridge_gcal_connected($id)), 200);
+}
+function fvc_bridge_rest_gcal_disconnect($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0); if ( ! $id || ! fvc_bridge_booking_owns($id) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not allowed'), 403);
+    delete_post_meta($id, '_fvc_gcal_tokens');
+    return new WP_REST_Response(array('ok' => true), 200);
 }
 
 // ============================================================
