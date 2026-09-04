@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.92
+ * Version: 1.16.94
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.92');
+define('FVC_BRIDGE_VERSION',    '1.16.94');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -134,6 +134,8 @@ add_action('rest_api_init', function () {
         'callback'            => 'fvc_bridge_rest_inspect',
     ));
     // Token-gated: publish an already-stored, approved submission BY ID.
+    register_rest_route('fvc-bridge/v1', '/import-place', array('methods'=>'POST','permission_callback'=>'fvc_bridge_has_valid_token','callback'=>'fvc_bridge_rest_import_place'));
+    register_rest_route('fvc-bridge/v1', '/category-seo', array('methods'=>'POST','permission_callback'=>'fvc_bridge_has_valid_token','callback'=>'fvc_bridge_rest_category_seo'));
     register_rest_route('fvc-bridge/v1', '/create-listing', array(
         'methods'             => 'POST',
         'permission_callback' => 'fvc_bridge_require_token',
@@ -1588,6 +1590,84 @@ function fvc_bridge_rest_create_listing($req) {
         'status' => $status, 'categories' => $cats, 'notified' => $notified,
         'view' => get_permalink($post_id), 'edit' => admin_url('post.php?post=' . $post_id . '&action=edit'),
     ), 200);
+}
+
+// Ensure a gd_placecategory term exists (by slug); create with a description if new,
+// and set its Rank Math SEO title/description (idempotent). Returns term_id.
+function fvc_bridge_ensure_place_category($slug, $name, $description = '', $seoTitle = '') {
+    $term = get_term_by('slug', $slug, 'gd_placecategory');
+    $tid = 0;
+    if ( $term && ! is_wp_error($term) ) { $tid = (int) $term->term_id; }
+    else {
+        $r = wp_insert_term($name, 'gd_placecategory', array('slug' => $slug, 'description' => $description));
+        if ( is_wp_error($r) ) return 0;
+        $tid = (int) $r['term_id'];
+    }
+    if ( $tid ) {
+        if ( $description ) update_term_meta($tid, 'rank_math_description', $description);
+        if ( $seoTitle ) update_term_meta($tid, 'rank_math_title', $seoTitle);
+    }
+    return $tid;
+}
+// REST: set/refresh a clinic category's SEO (creates the term if missing). Token-gated.
+function fvc_bridge_rest_category_seo($req) {
+    $b = $req->get_json_params(); if ( ! is_array($b) ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad body'), 400);
+    $slug = sanitize_title($b['slug'] ?? ''); $name = sanitize_text_field($b['name'] ?? '');
+    if ( ! $slug || ! $name ) return new WP_REST_Response(array('ok' => false, 'error' => 'slug and name required'), 400);
+    $tid = fvc_bridge_ensure_place_category($slug, $name, sanitize_textarea_field($b['description'] ?? ''), sanitize_text_field($b['title'] ?? ''));
+    if ( ! $tid ) return new WP_REST_Response(array('ok' => false, 'error' => 'failed'), 500);
+    return new WP_REST_Response(array('ok' => true, 'term_id' => $tid, 'link' => get_term_link($tid, 'gd_placecategory')), 200);
+}
+
+// REST: import ONE real clinic as a gd_place (or re-tag an existing one with a new category).
+// Token-gated. Dedupes by google_place_id then exact title. Used to build out new categories
+// from gathered Google Places data. Creates the category term if it doesn't exist yet.
+function fvc_bridge_rest_import_place($req) {
+    $b = $req->get_json_params(); if ( ! is_array($b) ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad body'), 400);
+    $name = sanitize_text_field($b['name'] ?? '');
+    $catSlug = sanitize_title($b['category_slug'] ?? '');
+    $catName = sanitize_text_field($b['category_name'] ?? '');
+    if ( ! $name || ! $catSlug ) return new WP_REST_Response(array('ok' => false, 'error' => 'name and category_slug required'), 400);
+    $catId = fvc_bridge_ensure_place_category($catSlug, $catName ?: $name, sanitize_textarea_field($b['category_description'] ?? ''));
+    if ( ! $catId ) return new WP_REST_Response(array('ok' => false, 'error' => 'could not create category'), 500);
+    global $wpdb; $t = $wpdb->prefix . 'geodir_gd_place_detail';
+    $placeId = sanitize_text_field($b['place_id'] ?? '');
+    // dedupe: existing listing by place_id, else exact title
+    $existing = 0;
+    if ( $placeId ) $existing = (int) $wpdb->get_var($wpdb->prepare("SELECT post_id FROM $t WHERE google_place_id=%s LIMIT 1", $placeId));
+    if ( ! $existing ) $existing = (int) $wpdb->get_var($wpdb->prepare("SELECT post_id FROM $t WHERE post_title=%s LIMIT 1", $name));
+    if ( $existing ) {
+        // re-tag: add this category to the existing listing (idempotent)
+        $row = $wpdb->get_row($wpdb->prepare("SELECT post_category FROM $t WHERE post_id=%d", $existing), ARRAY_A);
+        $cur = array_filter(array_map('intval', explode(',', (string) ($row['post_category'] ?? ''))));
+        if ( ! in_array($catId, $cur, true) ) {
+            $cur[] = $catId;
+            $wpdb->update($t, array('post_category' => ',' . implode(',', $cur) . ','), array('post_id' => $existing));
+            $wpdb->query($wpdb->prepare("INSERT IGNORE INTO {$wpdb->prefix}term_relationships (object_id, term_taxonomy_id, term_order) VALUES (%d, %d, 0)", $existing, $catId));
+            $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}term_taxonomy SET count = count + 1 WHERE term_taxonomy_id = %d", $catId));
+        }
+        return new WP_REST_Response(array('ok' => true, 'post_id' => $existing, 'action' => 'tagged'), 200);
+    }
+    $status = (($b['status'] ?? 'publish') === 'draft') ? 'draft' : 'publish';
+    $post_id = wp_insert_post(array('post_type' => 'gd_place', 'post_status' => $status, 'post_title' => $name, 'post_content' => '', 'post_author' => 1), true);
+    if ( is_wp_error($post_id) ) return new WP_REST_Response(array('ok' => false, 'error' => $post_id->get_error_message()), 500);
+    $wpdb->replace($t, array(
+        'post_id' => $post_id, 'post_title' => $name, '_search_title' => strtolower($name), 'post_status' => $status,
+        'post_tags' => '', 'post_category' => ',' . $catId . ',', 'default_category' => $catId, 'featured' => 0,
+        'overall_rating' => 0, 'rating_count' => 0,
+        'street' => sanitize_text_field($b['address'] ?? ''), 'street2' => '', 'city' => sanitize_text_field($b['city'] ?? 'Vancouver'),
+        'region' => 'British Columbia', 'country' => 'Canada', 'zip' => sanitize_text_field($b['zip'] ?? ''),
+        'neighbourhood' => sanitize_text_field($b['neighbourhood'] ?? ''),
+        'latitude' => (string) ($b['lat'] ?? ''), 'longitude' => (string) ($b['lng'] ?? ''),
+        'icbc_approved' => 0, '_worksafebc_approved' => 0, 'direct_billing' => 0, 'online_booking_available' => 0,
+        'website' => esc_url_raw($b['website'] ?? ''), 'l' => sanitize_text_field($b['phone'] ?? ''), 'email' => '',
+        'google_place_id' => $placeId, 'google_rating' => (float) ($b['rating'] ?? 0), 'google_review_count' => (int) ($b['reviews'] ?? 0),
+        'business_status' => 'OPERATIONAL', 'enrichment_status' => 'imported',
+    ));
+    $wpdb->query($wpdb->prepare("INSERT IGNORE INTO {$wpdb->prefix}term_relationships (object_id, term_taxonomy_id, term_order) VALUES (%d, %d, 0)", $post_id, $catId));
+    $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}term_taxonomy SET count = count + 1 WHERE term_taxonomy_id = %d", $catId));
+    if ( $status === 'publish' && function_exists('fvc_bridge_indexnow_ping') ) fvc_bridge_indexnow_ping(get_permalink($post_id));
+    return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'action' => 'created', 'view' => get_permalink($post_id)), 200);
 }
 
 // REST: send the "your listing is now live" email for a published listing, to a
