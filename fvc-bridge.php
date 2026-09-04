@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.124
+ * Version: 1.16.125
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.124');
+define('FVC_BRIDGE_VERSION',    '1.16.125');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -2424,6 +2424,11 @@ function fvc_bridge_rest_publish_post($req) {
         'post_author'  => 1,
     );
     if ( $existing ) $postarr['ID'] = $existing->ID;
+    // Optional backdate (e.g. evergreen advice posts dated over past months).
+    if ( ! empty($p['date']) ) {
+        $ts = strtotime(sanitize_text_field($p['date']));
+        if ( $ts ) { $postarr['post_date'] = date('Y-m-d H:i:s', $ts); $postarr['post_date_gmt'] = get_gmt_from_date($postarr['post_date']); }
+    }
 
     // wp_insert_post applies KSES (strips <style> etc.) for users without unfiltered_html.
     // For trusted raw_html content, lift KSES around the insert, then restore it.
@@ -2434,6 +2439,7 @@ function fvc_bridge_rest_publish_post($req) {
 
     if ( $post_type === 'post' && ! empty($p['category']) ) {
         $cat = is_numeric($p['category']) ? (int) $p['category'] : get_cat_ID(sanitize_text_field($p['category']));
+        if ( ! $cat && ! is_numeric($p['category']) ) { $cat = wp_create_category(sanitize_text_field($p['category'])); } // create if missing
         if ( $cat ) wp_set_post_categories($post_id, array($cat));
     }
     if ( isset($p['template']) ) {
