@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.97
+ * Version: 1.16.98
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.97');
+define('FVC_BRIDGE_VERSION',    '1.16.98');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1064,7 +1064,7 @@ function fvc_bridge_header_css() {
 #fvcMobileMenu>a{display:block!important;padding:9px 2px!important;font-size:15px!important;font-weight:500!important;color:rgba(255,255,255,.84)!important;border-bottom:1px solid rgba(255,255,255,.07)!important;transition:color .12s!important;}
 #fvcMobileMenu>a:hover,#fvcMobileMenu>a:active{color:#4fe8e3!important;}
 #fvcMobileMenu .fvc-mm-grid{display:grid!important;grid-template-columns:1fr 1fr!important;gap:6px!important;margin:3px 0 2px!important;}
-#fvcMobileMenu .fvc-mm-grid a{display:flex!important;flex-direction:column!important;gap:1px!important;padding:9px 11px!important;border:1px solid rgba(255,255,255,.1)!important;border-radius:8px!important;background:rgba(255,255,255,.03)!important;}
+#fvcMobileMenu .fvc-mm-grid a{display:flex!important;align-items:center!important;justify-content:center!important;text-align:center!important;min-height:46px!important;padding:10px!important;border:1px solid rgba(255,255,255,.1)!important;border-radius:8px!important;background:rgba(255,255,255,.03)!important;}
 #fvcMobileMenu .fvc-mm-grid a:active{background:rgba(255,255,255,.07)!important;}
 #fvcMobileMenu .fvc-dm-n{font-size:14px!important;font-weight:600!important;color:#fff!important;}
 #fvcMobileMenu .fvc-dm-d{font-size:11px!important;font-weight:400!important;color:rgba(255,255,255,.45)!important;line-height:1.3!important;}
@@ -1083,10 +1083,10 @@ body:has(#fvcMobileMenu.open) #fvcHamburger .fvc-hamburger-bar:nth-child(3){tran
 #fvcNavWrap a.fvc-nav-ai{display:inline-flex!important;align-items:center!important;gap:6px!important;color:rgba(255,255,255,.9)!important;}
 #fvcNavWrap a.fvc-nav-ai:hover{color:#fff!important;}
 #fvcNavWrap .fvc-nav-chip{font-size:9px!important;font-weight:700!important;letter-spacing:.5px!important;background:linear-gradient(135deg,#12c7c1,#0a9b96)!important;color:#fff!important;padding:2px 5px!important;border-radius:4px!important;}
-/* AI Finder card pinned to the top of the mobile menu */
-#fvcMobileMenu>a.fvc-mm-ai-top{display:block!important;margin:6px 0 2px!important;padding:13px 14px!important;border:1px solid rgba(18,199,193,.3)!important;border-bottom:1px solid rgba(18,199,193,.3)!important;border-radius:10px!important;background:linear-gradient(135deg,rgba(18,199,193,.16),rgba(10,155,150,.07))!important;}
-#fvcMobileMenu .fvc-mm-ai-t{display:block!important;font-size:15px!important;font-weight:700!important;color:#fff!important;}
-#fvcMobileMenu .fvc-mm-ai-d{display:block!important;font-size:12px!important;font-weight:400!important;color:rgba(255,255,255,.6)!important;margin-top:2px!important;}
+/* AI Finder: a single compact row pinned to the top of the mobile menu (not a full banner) */
+#fvcMobileMenu>a.fvc-mm-ai{display:flex!important;align-items:center!important;gap:8px!important;margin:6px 0 2px!important;padding:12px 14px!important;border:1px solid rgba(18,199,193,.32)!important;border-bottom:1px solid rgba(18,199,193,.32)!important;border-radius:10px!important;background:linear-gradient(135deg,rgba(18,199,193,.14),rgba(10,155,150,.05))!important;}
+#fvcMobileMenu .fvc-mm-ai-t{font-size:14.5px!important;font-weight:600!important;color:#fff!important;}
+#fvcMobileMenu .fvc-mm-ai-go{margin-left:auto!important;color:#4fe8e3!important;font-weight:700!important;font-size:17px!important;line-height:1!important;}
 /* locked type scale: section headings identical across the home page */
 .fvc-cats-section h2.fvc-cats-h2,.fvc-cta-section h2.fvc-cta-h2,.fvc-cta-strip .fvc-cta-strip-inner h2,body .fvc-section-h2{font-size:clamp(28px,4.5vw,42px)!important;line-height:1.12!important;letter-spacing:-.03em!important;font-weight:500!important;}
 /* heading WEIGHT consistency: site headings are 500 (single-listing 400, claim-CTA 700, blog 400) */
@@ -1148,16 +1148,16 @@ body .fvc-filter-title{color:rgba(255,255,255,.62)!important;}
   function buildMobile(svc){
     var mm=document.getElementById('fvcMobileMenu');
     if(!mm||mm.getAttribute('data-mega'))return;
-    var h='<a class="fvc-mm-ai-top" href="/vancouver-clinic-finder/"><span class="fvc-mm-ai-t">AI Clinic Finder <span class="fvc-mm-chip">AI</span></span><span class="fvc-mm-ai-d">Describe your issue &mdash; get matched in seconds</span></a>';
+    var h='<a class="fvc-mm-ai" href="/vancouver-clinic-finder/"><span class="fvc-mm-ai-t">AI Clinic Finder</span><span class="fvc-mm-chip">AI</span><span class="fvc-mm-ai-go">&rarr;</span></a>';
     h+='<span class="fvc-mobile-section-label">Browse by specialty</span><div class="fvc-mm-grid">';
-    svc.forEach(function(s){h+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span><span class="fvc-dm-d">'+esc(s.desc||DESC[s.name.toLowerCase()]||'')+'</span></a>';});
+    svc.forEach(function(s){h+='<a href="'+esc(s.href)+'"><span class="fvc-dm-n">'+esc(s.name)+'</span></a>';});
     h+='</div><span class="fvc-mobile-section-label">Quick links</span>';
     h+='<a class="fvc-mm-ql" data-fvc-area="/find-a-clinic-by-area/" href="/find-a-clinic-by-area/">Find by area</a>';
     h+='<a class="fvc-mm-ql" href="/icbc-approved-clinics-vancouver/">ICBC-approved</a>';
     h+='<a class="fvc-mm-ql" href="/worksafebc-approved-clinics-vancouver/">WorkSafeBC-approved</a>';
     h+='<a class="fvc-mm-ql" href="/places/">All clinics</a>';
     h+='<span class="fvc-mobile-section-label">For clinics</span>';
-    h+='<a data-fvc-area="/clinic-tools/" href="/clinic-tools/">For clinics &mdash; tools &amp; free site</a>';
+    h+='<a data-fvc-area="/clinic-tools/" href="/clinic-tools/">Tools &amp; free website</a>';
     mm.innerHTML=h;
     mm.setAttribute('data-mega','1');
   }
@@ -1276,31 +1276,8 @@ function fvc_bridge_footer_categories() {
 HTML;
 }
 
-// Complete the homepage "Browse by specialty" grid with every category (it hardcoded the first 5).
-// Clones the existing card structure so styling matches; sets a fitting image per new category.
-add_action('wp_footer', 'fvc_bridge_home_categories', 98);
-function fvc_bridge_home_categories() {
-    if ( fvc_bridge_is_standalone() ) return;
-    echo <<<'HTML'
-<script>(function(){
-  var CATS=window.FVC_CATS||[];if(!CATS.length)return;
-  var U='https://findvancouverclinics.com/wp-content/uploads/2026/09/';
-  var IMG={'counselling-vancouver':U+'pexels-7615621.jpg','kinesiology-vancouver':U+'pexels-5793895.jpg','podiatry-vancouver':U+'pexels-5793695.jpg','dietitian-vancouver':U+'pexels-6111589.jpg'};
-  function add(){
-    var grid=document.querySelector('.fvc-cats-grid');if(!grid)return;
-    var cards=grid.querySelectorAll('.fvc-cat-card');if(!cards.length)return;
-    var have={};cards.forEach(function(a){var m=(a.getAttribute('href')||'').match(/\/category\/([^\/]+)/);if(m)have[m[1]]=1;});
-    var tmpl=cards[cards.length-1];
-    CATS.forEach(function(c){var m=(c.h||'').match(/\/category\/([^\/]+)/);var slug=m?m[1]:'';if(!slug||have[slug])return;
-      var node=tmpl.cloneNode(true);node.setAttribute('href',c.h);node.setAttribute('data-fvc-cat',slug);
-      var nm=node.querySelector('.fvc-cat-name');if(nm)nm.textContent=c.n;
-      var im=node.querySelector('.fvc-cat-img');if(im&&IMG[slug])im.style.backgroundImage="url('"+IMG[slug]+"')";
-      grid.appendChild(node);have[slug]=1;});
-  }
-  if(document.readyState!=='loading')add();else document.addEventListener('DOMContentLoaded',add);
-})();</script>
-HTML;
-}
+// (Homepage "Browse by specialty" cards are now all 9 categories, server-rendered in the
+// Elementor HTML widget on the front page with optimized images — no JS injector needed.)
 
 // Suppress the legacy WPCode handlers at runtime (priority 0, before they fire),
 // so the bridge is the sole handler even if snippets #1071/#1015 are still active.
@@ -1908,6 +1885,22 @@ function fvc_bridge_rest_set_featured_image($req) {
         set_post_thumbnail($post_id, $att);
         fvc_bridge_log('set-featured-image', "post=$post_id attach=$att (existing)");
         return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'attachment_id' => $att, 'url' => wp_get_attachment_url($att)), 200);
+    }
+
+    // Reuse an existing media-library image by its URL (e.g. a post's own in-content hero).
+    $img_url = esc_url_raw($p['image_url'] ?? '');
+    if ( $img_url ) {
+        $aid = attachment_url_to_postid($img_url);
+        if ( ! $aid ) { // resized URLs (…-1024x683.jpg) don't resolve — retry against the original
+            $stripped = preg_replace('/-\d+x\d+(\.[A-Za-z]+)$/', '$1', $img_url);
+            if ( $stripped !== $img_url ) $aid = attachment_url_to_postid($stripped);
+        }
+        if ( $aid && get_post($aid) ) {
+            set_post_thumbnail($post_id, $aid);
+            fvc_bridge_log('set-featured-image', "post=$post_id url-attach=$aid");
+            return new WP_REST_Response(array('ok' => true, 'post_id' => $post_id, 'attachment_id' => $aid, 'url' => wp_get_attachment_url($aid)), 200);
+        }
+        return new WP_REST_Response(array('ok' => false, 'error' => 'image_url did not resolve to a media attachment'), 400);
     }
 
     $b64      = $p['image_base64'] ?? '';
