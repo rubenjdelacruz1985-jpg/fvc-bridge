@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.85
+ * Version: 1.16.86
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.85');
+define('FVC_BRIDGE_VERSION',    '1.16.86');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -230,6 +230,9 @@ add_action('rest_api_init', function () {
     register_rest_route('fvc-bridge/v1', '/chart-get', array('methods'=>'GET','permission_callback'=>'is_user_logged_in','callback'=>'fvc_bridge_rest_chart_get'));
     register_rest_route('fvc-bridge/v1', '/chart-save', array('methods'=>'POST','permission_callback'=>'is_user_logged_in','callback'=>'fvc_bridge_rest_chart_save'));
     register_rest_route('fvc-bridge/v1', '/chart-lock', array('methods'=>'POST','permission_callback'=>'is_user_logged_in','callback'=>'fvc_bridge_rest_chart_lock'));
+    register_rest_route('fvc-bridge/v1', '/credit-check', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_credit_check'));
+    register_rest_route('fvc-bridge/v1', '/giftcard-buy', array('methods'=>'POST','permission_callback'=>'fvc_bridge_require_token_or_public','callback'=>'fvc_bridge_rest_giftcard_buy'));
+    register_rest_route('fvc-bridge/v1', '/giftcard-verify', array('methods'=>'GET','permission_callback'=>'__return_true','callback'=>'fvc_bridge_rest_giftcard_verify'));
     register_rest_route('fvc-bridge/v1', '/clinic-generate', array('methods'=>'POST','permission_callback'=>function(){return is_user_logged_in()||fvc_bridge_has_valid_token();},'callback'=>'fvc_bridge_rest_clinic_generate'));
     // Public read: a clinic's listing data, formatted to seed the site builder.
     register_rest_route('fvc-bridge/v1', '/clinic-data', array(
@@ -2003,7 +2006,7 @@ function fvc_bridge_booking_table() { global $wpdb; return $wpdb->prefix . 'fvc_
 function fvc_bridge_booking_ensure_table() {
     global $wpdb;
     $t = fvc_bridge_booking_table();
-    if ( get_option('fvc_bridge_booking_db') === '5' ) return;
+    if ( get_option('fvc_bridge_booking_db') === '6' ) return;
     require_once ABSPATH . 'wp-admin/includes/upgrade.php';
     $charset = $wpdb->get_charset_collate();
     dbDelta("CREATE TABLE $t (
@@ -2027,12 +2030,14 @@ function fvc_bridge_booking_ensure_table() {
         reminded TINYINT DEFAULT 0,
         intake TEXT,
         stripe_acct VARCHAR(40) DEFAULT '',
+        credit_code VARCHAR(40) DEFAULT '',
+        credit_applied_cents INT DEFAULT 0,
         created_at DATETIME NOT NULL,
         PRIMARY KEY (id),
         KEY listing_id (listing_id),
         KEY start_local (start_local)
     ) $charset;");
-    update_option('fvc_bridge_booking_db', '5');
+    update_option('fvc_bridge_booking_db', '6');
 }
 
 function fvc_bridge_booking_defaults($listing_id) {
@@ -2055,6 +2060,7 @@ function fvc_bridge_booking_defaults($listing_id) {
         'pay' => array('mode' => 'off', 'depositType' => 'fixed', 'depositAmount' => 0, 'currency' => 'cad', 'pk' => ''),
         'reminders' => true,
         'intake' => array(), // custom questions: [{q, type:'text'|'textarea', required:bool}]
+        'giftcardsOn' => false,
     );
 }
 // Compute the amount owed (in cents) for a service under the pay config; 0 = no upfront payment.
@@ -2166,6 +2172,7 @@ function fvc_bridge_rest_booking_config_save($req) {
         'maxAdvanceDays' => min(365, max(1, (int) ($b['maxAdvanceDays'] ?? 60))),
         'cancelWindowHours' => max(0, (int) ($b['cancelWindowHours'] ?? 24)),
         'reminders' => ! empty($b['reminders']),
+        'giftcardsOn' => ! empty($b['giftcardsOn']),
         'intake' => array_values(array_filter(array_map(function ($q) {
             $qt = sanitize_text_field($q['q'] ?? '');
             return $qt === '' ? null : array('q' => $qt, 'type' => in_array(($q['type'] ?? 'text'), array('text','textarea'), true) ? $q['type'] : 'text', 'required' => ! empty($q['required']));
@@ -2408,19 +2415,30 @@ function fvc_bridge_rest_booking_create($req) {
     $cfg['clinic'] = html_entity_decode($p->post_title, ENT_QUOTES);
     $amount = fvc_bridge_booking_amount_cents($cfg, $svc);
     $creds = fvc_bridge_booking_pay_creds($id);
-    $needPay = ( $amount > 0 && $creds['mode'] !== 'none' );
     $cur = $cfg['pay']['currency'] ?? 'cad';
+    // gift-card / credit redemption
+    $code = strtoupper(trim((string) ($b['code'] ?? '')));
+    $credit = ( $code && $amount > 0 && get_option('fvc_bridge_credits_db') === '1' ) ? fvc_bridge_credit_by_code($id, $code) : null;
+    $applied = ( $credit && (int) $credit['balance_cents'] > 0 ) ? min((int) $credit['balance_cents'], $amount) : 0;
+    $due = max(0, $amount - $applied);
+    $needPay = ( $due > 0 && $creds['mode'] !== 'none' );
+    $fullyCovered = ( $amount > 0 && $applied >= $amount );
     $wpdb->insert($t, array(
         'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
         'start_local' => $s, 'end_local' => $e, 'name' => $name, 'email' => $email, 'phone' => $phone,
         'notes' => $notes, 'status' => $needPay ? 'awaiting_payment' : 'pending', 'manage_key' => $key,
-        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'intake' => $intakeJson,
-        'stripe_acct' => $needPay ? $creds['account'] : '', 'created_at' => current_time('mysql'),
+        'amount_cents' => $needPay ? $due : 0, 'currency' => $cur, 'intake' => $intakeJson,
+        'stripe_acct' => $needPay ? $creds['account'] : '', 'credit_code' => $applied > 0 ? $code : '', 'credit_applied_cents' => $applied,
+        'paid' => $fullyCovered ? 1 : 0, 'created_at' => current_time('mysql'),
     ));
     $aid = (int) $wpdb->insert_id;
     $appt = array('id' => $aid, 'listing_id' => $id, 'service' => $svc, 'practitioner' => $pract,
         'start_local' => $s, 'end_local' => $e, 'name' => $name, 'email' => $email, 'phone' => $phone, 'notes' => $notes,
-        'amount_cents' => $needPay ? $amount : 0, 'currency' => $cur, 'intake' => $intakeJson);
+        'amount_cents' => $fullyCovered ? $applied : ( $needPay ? $due : 0 ), 'currency' => $cur, 'intake' => $intakeJson);
+    // deduct a credit that fully covers the booking (no Stripe step)
+    if ( $fullyCovered && $applied > 0 && $credit ) {
+        $wpdb->query($wpdb->prepare("UPDATE " . fvc_bridge_credits_table() . " SET balance_cents=GREATEST(0,balance_cents-%d) WHERE id=%d", $applied, (int) $credit['id']));
+    }
     $when = $start->format('l, F j') . ' at ' . $start->format('g:i a');
     $manageUrl = add_query_arg(array('appt' => $aid, 'key' => $key), home_url('/booking-manage/'));
     $icsUrl = add_query_arg(array('appt' => $aid, 'key' => $key), rest_url('fvc-bridge/v1/booking-ics'));
@@ -2434,7 +2452,7 @@ function fvc_bridge_rest_booking_create($req) {
             'client_reference_id' => (string) $aid, 'customer_email' => $email,
             'line_items[0][quantity]' => 1,
             'line_items[0][price_data][currency]' => $cur,
-            'line_items[0][price_data][unit_amount]' => $amount,
+            'line_items[0][price_data][unit_amount]' => $due,
             'line_items[0][price_data][product_data][name]' => $label,
             'payment_intent_data[metadata][appt]' => (string) $aid,
             'payment_intent_data[metadata][listing]' => (string) $id,
@@ -2479,6 +2497,10 @@ function fvc_bridge_rest_booking_verify_payment($req) {
     $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($row['stripe_session']), array(), $acct);
     if ( ($sess['payment_status'] ?? '') !== 'paid' ) return new WP_REST_Response(array('ok' => false, 'pending' => true, 'error' => 'Payment not completed yet.'), 200);
     $wpdb->update($t, array('paid' => 1, 'status' => 'pending'), array('id' => $aid));
+    if ( (int) ($row['credit_applied_cents'] ?? 0) > 0 && ! empty($row['credit_code']) ) {
+        $cr = fvc_bridge_credit_by_code((int) $row['listing_id'], $row['credit_code']);
+        if ( $cr ) $wpdb->query($wpdb->prepare("UPDATE " . fvc_bridge_credits_table() . " SET balance_cents=GREATEST(0,balance_cents-%d) WHERE id=%d", (int) $row['credit_applied_cents'], (int) $cr['id']));
+    }
     $appt = $row; $appt['status'] = 'pending';
     fvc_bridge_booking_emails_new($appt, $cfg, $manageUrl);
     return new WP_REST_Response(array('ok' => true, 'paid' => true, 'when' => $when, 'manageUrl' => $manageUrl, 'icsUrl' => $icsUrl), 200);
@@ -2875,6 +2897,88 @@ function fvc_bridge_rest_chart_lock($req) {
     if ( ! $c ) return new WP_REST_Response(array('ok' => false, 'error' => 'Save the note first.'), 400);
     $wpdb->update($t, array('locked_at' => current_time('mysql')), array('id' => (int) $c['id']));
     return new WP_REST_Response(array('ok' => true, 'locked' => true), 200);
+}
+
+// ============================================================
+//  Credits — gift cards & prepaid packages ($ balance by code), redeemable at booking.
+// ============================================================
+function fvc_bridge_credits_table() { global $wpdb; return $wpdb->prefix . 'fvc_credits'; }
+function fvc_bridge_credits_ensure() {
+    global $wpdb; if ( get_option('fvc_bridge_credits_db') === '1' ) return;
+    require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+    dbDelta("CREATE TABLE " . fvc_bridge_credits_table() . " (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT, listing_id BIGINT UNSIGNED NOT NULL, code VARCHAR(40) DEFAULT '',
+        kind VARCHAR(20) DEFAULT 'giftcard', balance_cents INT DEFAULT 0, init_cents INT DEFAULT 0, currency VARCHAR(8) DEFAULT 'cad',
+        email VARCHAR(190) DEFAULT '', status VARCHAR(20) DEFAULT 'pending', stripe_session VARCHAR(120) DEFAULT '', stripe_acct VARCHAR(40) DEFAULT '',
+        manage_key VARCHAR(40) DEFAULT '', created_at DATETIME NOT NULL,
+        PRIMARY KEY (id), KEY code (code), KEY listing_id (listing_id)
+    ) " . $wpdb->get_charset_collate() . ";");
+    update_option('fvc_bridge_credits_db', '1');
+}
+function fvc_bridge_credit_gencode() {
+    $a = strtoupper(preg_replace('/[0OL1I]/', '', wp_generate_password(28, false)));
+    $a = substr($a . 'ABCDEFGHJKMNPQRSTUVWXYZ', 0, 12);
+    return substr($a, 0, 4) . '-' . substr($a, 4, 4) . '-' . substr($a, 8, 4);
+}
+function fvc_bridge_credit_by_code($listing_id, $code) {
+    global $wpdb; $t = fvc_bridge_credits_table();
+    return $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE listing_id=%d AND code=%s AND status='active' LIMIT 1", $listing_id, strtoupper(trim($code))), ARRAY_A);
+}
+function fvc_bridge_rest_credit_check($req) {
+    $id = (int) $req->get_param('listing'); $code = strtoupper(trim((string) $req->get_param('code')));
+    if ( ! $id || ! $code ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    if ( get_option('fvc_bridge_credits_db') !== '1' ) return new WP_REST_Response(array('ok' => false, 'error' => 'Invalid code.'), 404);
+    $c = fvc_bridge_credit_by_code($id, $code);
+    if ( ! $c || (int) $c['balance_cents'] <= 0 ) return new WP_REST_Response(array('ok' => false, 'error' => 'That code isn\'t valid or has no balance left.'), 404);
+    return new WP_REST_Response(array('ok' => true, 'balanceCents' => (int) $c['balance_cents'], 'currency' => $c['currency']), 200);
+}
+function fvc_bridge_rest_giftcard_buy($req) {
+    $b = $req->get_json_params(); $id = (int) ($b['listing_id'] ?? 0);
+    $p = $id ? get_post($id) : null;
+    if ( ! $p || $p->post_type !== 'gd_place' ) return new WP_REST_Response(array('ok' => false, 'error' => 'clinic not found'), 404);
+    $cfg = fvc_bridge_booking_get_config($id);
+    if ( empty($cfg['giftcardsOn']) ) return new WP_REST_Response(array('ok' => false, 'error' => 'This clinic isn\'t selling gift cards.'), 400);
+    $amount = (int) round(((float) ($b['amount'] ?? 0)) * 100);
+    if ( $amount < 500 ) return new WP_REST_Response(array('ok' => false, 'error' => 'Minimum gift card is $5.'), 400);
+    $email = sanitize_email($b['email'] ?? '');
+    if ( ! is_email($email) ) return new WP_REST_Response(array('ok' => false, 'error' => 'A valid email is required.'), 400);
+    $creds = fvc_bridge_booking_pay_creds($id);
+    if ( $creds['mode'] === 'none' ) return new WP_REST_Response(array('ok' => false, 'error' => 'Payments aren\'t set up for this clinic.'), 400);
+    fvc_bridge_credits_ensure();
+    global $wpdb; $cur = $cfg['pay']['currency'] ?? 'cad'; $key = wp_generate_password(24, false); $code = fvc_bridge_credit_gencode();
+    $wpdb->insert(fvc_bridge_credits_table(), array('listing_id' => $id, 'code' => $code, 'kind' => 'giftcard', 'balance_cents' => 0, 'init_cents' => $amount, 'currency' => $cur, 'email' => $email, 'status' => 'pending', 'stripe_acct' => $creds['account'], 'manage_key' => $key, 'created_at' => current_time('mysql')));
+    $cid = (int) $wpdb->insert_id; $clinic = html_entity_decode($p->post_title, ENT_QUOTES);
+    $success = add_query_arg(array('clinic' => $id, 'gc' => $cid, 'k' => $key, 'paid' => 1), home_url('/gift-card/'));
+    $cancel = add_query_arg(array('clinic' => $id, 'cancelled' => 1), home_url('/gift-card/'));
+    $params = array('mode' => 'payment', 'success_url' => $success, 'cancel_url' => $cancel, 'customer_email' => $email,
+        'line_items[0][quantity]' => 1, 'line_items[0][price_data][currency]' => $cur, 'line_items[0][price_data][unit_amount]' => $amount,
+        'line_items[0][price_data][product_data][name]' => 'Gift card · ' . $clinic, 'metadata[credit]' => (string) $cid);
+    if ( $creds['mode'] === 'connect' ) { $fee = (int) round($amount * fvc_bridge_stripe_platform_fee_pct() / 100); if ( $fee > 0 ) $params['payment_intent_data[application_fee_amount]'] = $fee; }
+    $sess = fvc_bridge_stripe_api($creds['sk'], 'POST', 'checkout/sessions', $params, $creds['account']);
+    if ( empty($sess['url']) || empty($sess['id']) ) { $wpdb->delete(fvc_bridge_credits_table(), array('id' => $cid)); return new WP_REST_Response(array('ok' => false, 'error' => isset($sess['error']['message']) ? $sess['error']['message'] : 'Could not start payment.'), 502); }
+    $wpdb->update(fvc_bridge_credits_table(), array('stripe_session' => $sess['id']), array('id' => $cid));
+    return new WP_REST_Response(array('ok' => true, 'checkoutUrl' => $sess['url']), 200);
+}
+function fvc_bridge_rest_giftcard_verify($req) {
+    $cid = (int) $req->get_param('gc'); $key = sanitize_text_field((string) $req->get_param('key'));
+    if ( ! $cid || ! $key ) return new WP_REST_Response(array('ok' => false, 'error' => 'bad request'), 400);
+    global $wpdb; $t = fvc_bridge_credits_table();
+    $c = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $cid), ARRAY_A);
+    if ( ! $c || ! hash_equals($c['manage_key'], $key) ) return new WP_REST_Response(array('ok' => false, 'error' => 'not found'), 404);
+    if ( $c['status'] === 'active' ) return new WP_REST_Response(array('ok' => true, 'code' => $c['code'], 'balanceCents' => (int) $c['balance_cents'], 'currency' => $c['currency']), 200);
+    $acct = $c['stripe_acct'] ?? ''; $sk = $acct ? fvc_bridge_stripe_platform_sk() : fvc_bridge_booking_secret((int) $c['listing_id']);
+    if ( ! $sk || ! $c['stripe_session'] ) return new WP_REST_Response(array('ok' => false, 'error' => 'no payment on file'), 400);
+    $sess = fvc_bridge_stripe_api($sk, 'GET', 'checkout/sessions/' . rawurlencode($c['stripe_session']), array(), $acct);
+    if ( ($sess['payment_status'] ?? '') !== 'paid' ) return new WP_REST_Response(array('ok' => false, 'pending' => true, 'error' => 'Payment not completed yet.'), 200);
+    $wpdb->update($t, array('status' => 'active', 'balance_cents' => (int) $c['init_cents']), array('id' => $cid));
+    if ( function_exists('fvc_bridge_email_shell') && is_email($c['email']) ) {
+        $clinic = html_entity_decode(get_the_title((int) $c['listing_id']), ENT_QUOTES);
+        $inner = '<p style="margin:0 0 14px;font-size:15px;color:#3f3f46;">Thanks for your purchase! Here is your gift card for <strong>' . esc_html($clinic) . '</strong>.</p>'
+            . '<div style="background:#f7f7f7;border-left:3px solid #09BDB8;border-radius:8px;padding:16px;text-align:center"><div style="font-size:13px;color:#6b6b6e">Gift card code</div><div style="font-size:22px;font-weight:700;letter-spacing:2px;color:#1d1d1f;margin:6px 0">' . esc_html($c['code']) . '</div><div style="font-size:14px;color:#3f3f46">' . esc_html(fvc_bridge_money($c['init_cents'], $c['currency'])) . '</div></div>'
+            . '<p style="margin:14px 0 0;font-size:13px;color:#6b6b6e">Redeem it at booking on the clinic\'s page.</p>';
+        wp_mail($c['email'], 'Your gift card — ' . $clinic, fvc_bridge_email_shell('Your gift card.', 'Your gift card', $inner), array('Content-Type: text/html; charset=UTF-8', 'From: Find Vancouver Clinics <noreply@findvancouverclinics.com>'));
+    }
+    return new WP_REST_Response(array('ok' => true, 'code' => $c['code'], 'balanceCents' => (int) $c['init_cents'], 'currency' => $c['currency']), 200);
 }
 
 // ============================================================
