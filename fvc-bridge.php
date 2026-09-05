@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.134
+ * Version: 1.16.135
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.134');
+define('FVC_BRIDGE_VERSION',    '1.16.135');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1648,8 +1648,8 @@ function fvc_bridge_card_polish() {
   body.home .fvc-cat-card{height:auto !important;min-height:0 !important;}
   body.home .fvc-cat-img{flex:0 0 auto !important;height:100px !important;}
   body.home .fvc-cat-name{font-size:13.5px !important;}
-  body.home .fvc-blog-img{height:130px !important;}
-  body.home .fvc-blog-card img{height:130px !important;object-fit:cover !important;width:100% !important;}
+  body.home .fvc-blog-img{aspect-ratio:16/9 !important;height:auto !important;}
+  body.home .fvc-blog-card img{aspect-ratio:16/9 !important;height:auto !important;object-fit:cover !important;width:100% !important;}
 }
 /* /blog/ archive -> light body + clean white cards (was dark + transparent hairline cards) */
 body.blog .elementor-element-1e583ba4{background:#f4f2ed !important;}
@@ -1660,7 +1660,7 @@ body.blog .e-loop-item h2,body.blog .e-loop-item h2 a,body.blog .e-loop-item .el
 body.blog .e-loop-item .elementor-widget-text-editor,body.blog .e-loop-item .elementor-widget-theme-post-excerpt,body.blog .e-loop-item p{color:#5b5b61 !important;}
 body.blog .e-loop-item .elementor-icon-list-text{color:#8a8a90 !important;}
 body.blog .e-loop-item .elementor-post-info__terms-list-item{color:#0a8078 !important;}
-body.blog .e-loop-item img{height:170px !important;object-fit:cover !important;width:100% !important;}
+body.blog .e-loop-item img{aspect-ratio:16/9 !important;height:auto !important;object-fit:cover !important;width:100% !important;}
 </style>
 HTML;
 }
