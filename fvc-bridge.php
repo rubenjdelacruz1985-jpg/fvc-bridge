@@ -2,14 +2,14 @@
 /**
  * Plugin Name: FVC Bridge
  * Description: Token-authenticated REST bridge + self-update channel for Find Vancouver Clinics.
- * Version: 1.16.135
+ * Version: 1.16.136
  * Author: Ruben de la Cruz
  * Update URI: https://github.com/rubenjdelacruz1985-jpg/fvc-bridge
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
-define('FVC_BRIDGE_VERSION',    '1.16.135');
+define('FVC_BRIDGE_VERSION',    '1.16.136');
 define('FVC_BRIDGE_SLUG',       'fvc-bridge');
 define('FVC_BRIDGE_BASENAME',   plugin_basename(__FILE__)); // fvc-bridge/fvc-bridge.php
 define('FVC_BRIDGE_MANIFEST',   'https://github.com/rubenjdelacruz1985-jpg/fvc-bridge/releases/latest/download/manifest.json');
@@ -1731,6 +1731,73 @@ body .fvc-sl-claim{color:#6e6e73 !important;}
 body .fvc-sl-claim a{color:#0a8078 !important;}
 </style>
 HTML;
+}
+
+// Internal linking on clinic profiles: a "More <category> clinics" block of real, server-rendered
+// <a> links to related profiles (same category, same-neighbourhood first, best-reviewed order).
+// This is indexing fuel — internal links are how Google discovers/crawls the deep profile pages
+// that are currently sitting as "crawled/discovered – not indexed", and it passes internal
+// authority to them. It's also useful UX (patients see nearby alternatives). Links live in the
+// page source (crawlable); a tiny script just relocates the block into the .fvc-sl-left column.
+add_action('wp_footer', 'fvc_bridge_nearby_clinics', 55);
+function fvc_bridge_nearby_clinics() {
+    if ( ! ( function_exists('is_singular') && is_singular('gd_place') ) ) return;
+    global $wpdb;
+    $id = (int) get_queried_object_id();
+    if ( ! $id ) return;
+    $terms = wp_get_post_terms($id, 'gd_placecategory');
+    if ( is_wp_error($terms) || empty($terms) ) return;
+    $term = $terms[0];
+    $t = $wpdb->prefix . 'geodir_gd_place_detail';
+    $hood = (string) $wpdb->get_var($wpdb->prepare("SELECT neighbourhood FROM {$t} WHERE post_id = %d", $id));
+    $rows = $wpdb->get_results($wpdb->prepare(
+        "SELECT p.ID, p.post_title, d.neighbourhood, d.google_rating AS rating, d.google_review_count AS reviews
+         FROM {$wpdb->prefix}posts p
+         JOIN {$wpdb->prefix}term_relationships tr ON tr.object_id = p.ID
+         JOIN {$wpdb->prefix}term_taxonomy tt ON tt.term_taxonomy_id = tr.term_taxonomy_id
+         JOIN {$t} d ON d.post_id = p.ID
+         WHERE p.post_type = 'gd_place' AND p.post_status = 'publish'
+           AND tt.taxonomy = 'gd_placecategory' AND tt.term_id = %d
+           AND p.ID <> %d
+         ORDER BY (TRIM(d.neighbourhood) = %s) DESC,
+                  (COALESCE(d.google_rating,0) * LN(GREATEST(COALESCE(d.google_review_count,0),1) + 1)) DESC
+         LIMIT 6",
+        $term->term_id, $id, $hood
+    ), ARRAY_A);
+    if ( empty($rows) ) return;
+    $catLc = strtolower($term->name);
+    ob_start(); ?>
+<div class="fvc-sl-nearby" data-fvc-nearby>
+  <span class="fvc-sl-label">More <?php echo esc_html($catLc); ?> clinics in Vancouver</span>
+  <ul class="fvc-sl-nearby-list">
+    <?php foreach ( $rows as $r ) :
+        $rt = (float) $r['rating']; $rc = (int) $r['reviews'];
+        $bits = array();
+        if ( $rt > 0 ) $bits[] = number_format($rt, 1) . '★' . ( $rc ? ' (' . number_format($rc) . ')' : '' );
+        $rh = trim((string) $r['neighbourhood']);
+        if ( $rh ) $bits[] = $rh;
+    ?>
+    <li class="fvc-sl-nearby-item">
+      <a href="<?php echo esc_url(get_permalink((int) $r['ID'])); ?>"><?php echo esc_html($r['post_title']); ?></a>
+      <?php if ( $bits ) : ?><span class="fvc-sl-nearby-meta"><?php echo esc_html(implode(' · ', $bits)); ?></span><?php endif; ?>
+    </li>
+    <?php endforeach; ?>
+  </ul>
+  <a class="fvc-sl-nearby-all" href="<?php echo esc_url(get_term_link($term)); ?>">See all <?php echo esc_html($catLc); ?> clinics &rarr;</a>
+</div>
+<script>(function(){var b=document.querySelector('[data-fvc-nearby]');var l=document.querySelector('.fvc-sl-left');if(b&&l)l.appendChild(b);})();</script>
+<style>
+.fvc-sl-nearby{margin-top:26px;padding-top:22px;border-top:1px solid rgba(9,9,11,.1);}
+.fvc-sl-nearby-list{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:11px;}
+.fvc-sl-nearby-item{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px;}
+.fvc-sl-nearby-item a{font-weight:600;color:#0a8078;text-decoration:none;}
+.fvc-sl-nearby-item a:hover{text-decoration:underline;}
+.fvc-sl-nearby-meta{font-size:13px;color:#8a8a8f;}
+.fvc-sl-nearby-all{display:inline-block;margin-top:16px;font-weight:600;color:#0a8078;text-decoration:none;}
+.fvc-sl-nearby-all:hover{text-decoration:underline;}
+</style>
+    <?php
+    echo ob_get_clean();
 }
 
 // BreadcrumbList JSON-LD for listings, category archives and blog posts (not otherwise output —
